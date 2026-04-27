@@ -38,6 +38,12 @@ use crate::customproxy::{
     Provider,
 };
 
+/// Hard cap on bytes streamed through the custom-provider streaming path
+/// for a single request body. Mirrors the buffered path's implicit
+/// limit; surfaced as an `io::Error` on the wrapped stream so reqwest
+/// fails the upload cleanly rather than buffering the lot.
+const MAX_CUSTOM_PROVIDER_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+
 /// Forward a buffered request to a custom upstream provider.
 ///
 /// `path` is the original request URL path (used to compute the upstream
@@ -226,6 +232,102 @@ pub async fn forward_to_custom_provider(
         .context("build axum streaming response")
 }
 
+/// Streaming variant of [`forward_to_custom_provider`]. Used by
+/// [`crate::amp::routes::handle`] for paths where it has determined no
+/// body mutation is needed; the body is piped chunk-by-chunk to the
+/// upstream instead of being held in memory.
+///
+/// This MUST NOT be used for `/messages` POST or for `/responses` POST when
+/// `provider.responses_translate` is true — those paths require body
+/// mutation and the SSE-collapse / responses-translation post-processing
+/// branches that depend on it. The caller is responsible for that gate.
+pub async fn forward_to_custom_provider_streaming(
+    provider: &Provider,
+    method: http::Method,
+    path: &str,
+    query: Option<&str>,
+    headers: &HeaderMap,
+    body: axum::body::Body,
+    client: &reqwest::Client,
+) -> anyhow::Result<Response> {
+    let base = provider.url.trim_end_matches('/');
+    let leaf = extract_leaf(path);
+    let mut url = format!("{base}{leaf}");
+    if let Some(q) = query {
+        if !q.is_empty() {
+            url.push('?');
+            url.push_str(q);
+        }
+    }
+
+    info!(
+        provider = %provider.name,
+        method = %method,
+        from = %path,
+        to = %url,
+        streaming = true,
+        "customproxy: forwarding (streaming body)"
+    );
+
+    let outbound_headers = sanitize_headers(headers, &provider.api_key, false);
+    let upstream_body = body_into_reqwest_capped(body);
+
+    let upstream = client
+        .request(reqwest_method(&method), &url)
+        .headers(outbound_headers)
+        .body(upstream_body)
+        .send()
+        .await
+        .with_context(|| format!("upstream request to {url}"))?;
+
+    let status = upstream.status();
+    let upstream_headers = upstream.headers().clone();
+    let stream = upstream.bytes_stream();
+
+    let mut response = Response::builder().status(status);
+    {
+        let h = response
+            .headers_mut()
+            .ok_or_else(|| anyhow!("response builder lost headers"))?;
+        for (k, v) in upstream_headers.iter() {
+            let name = k.as_str().to_ascii_lowercase();
+            if matches!(
+                name.as_str(),
+                "transfer-encoding" | "connection" | "keep-alive" | "upgrade"
+            ) {
+                continue;
+            }
+            h.append(k.clone(), v.clone());
+        }
+    }
+    response
+        .body(Body::from_stream(stream))
+        .context("build axum streaming response")
+}
+
+/// Bridge an axum request `Body` to a `reqwest::Body` that streams chunks
+/// upstream as they arrive, capped at [`MAX_CUSTOM_PROVIDER_REQUEST_BYTES`]
+/// total. Mirrors `crate::proxy::body_into_reqwest` but with a tighter cap
+/// suited to the custom-provider path.
+fn body_into_reqwest_capped(body: axum::body::Body) -> reqwest::Body {
+    let mut bytes_so_far: usize = 0;
+    let stream = body.into_data_stream().map(move |item| match item {
+        Ok(chunk) => {
+            bytes_so_far = bytes_so_far.saturating_add(chunk.len());
+            if bytes_so_far > MAX_CUSTOM_PROVIDER_REQUEST_BYTES {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "request body exceeds 16 MiB on custom-provider streaming path",
+                ))
+            } else {
+                Ok::<Bytes, std::io::Error>(chunk)
+            }
+        }
+        Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+    });
+    reqwest::Body::wrap_stream(stream)
+}
+
 /// Convert axum `http::Method` to reqwest's. They share the same underlying
 /// type as of reqwest 0.12, but we map by name to stay forward-compatible.
 fn reqwest_method(m: &http::Method) -> reqwest::Method {
@@ -360,5 +462,90 @@ mod tests {
             out.get("authorization").unwrap().to_str().unwrap(),
             "Bearer upstream-key"
         );
+    }
+
+    /// The streaming variant must hand reqwest a body whose underlying
+    /// data stream emits the same bytes the caller fed in, in order. We
+    /// can't introspect a `reqwest::Body` post-wrap (its `as_bytes()`
+    /// returns `None` for streamed bodies), so we exercise the same
+    /// counter+map pipeline the helper uses.
+    #[tokio::test]
+    async fn streaming_variant_pipes_body() {
+        let payload = b"hello world".to_vec();
+        let body = axum::body::Body::from(payload.clone());
+
+        // Mirror `body_into_reqwest_capped`'s pipeline up to (but not
+        // including) the `reqwest::Body::wrap_stream` call.
+        let mut bytes_so_far: usize = 0;
+        let mut stream = body.into_data_stream().map(move |item| match item {
+            Ok(chunk) => {
+                bytes_so_far = bytes_so_far.saturating_add(chunk.len());
+                if bytes_so_far > MAX_CUSTOM_PROVIDER_REQUEST_BYTES {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "exceeds cap",
+                    ))
+                } else {
+                    Ok::<Bytes, std::io::Error>(chunk)
+                }
+            }
+            Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+        });
+
+        let mut reassembled: Vec<u8> = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            reassembled.extend_from_slice(&chunk.expect("chunk"));
+        }
+        assert_eq!(reassembled, payload);
+
+        // And confirm the real helper at least produces a `reqwest::Body`
+        // (smoke test — the wrapper itself can't be drained without a
+        // network round-trip).
+        let body2 = axum::body::Body::from(payload.clone());
+        let _: reqwest::Body = body_into_reqwest_capped(body2);
+    }
+
+    /// Feeding more than `MAX_CUSTOM_PROVIDER_REQUEST_BYTES` through the
+    /// helper must surface an `Err` on the resulting stream rather than
+    /// silently buffering the lot. We drive the same map closure the
+    /// helper installs so we can observe the error directly.
+    #[tokio::test]
+    async fn streaming_variant_caps_body_size() {
+        // Build a stream of 17 chunks of 1 MiB = 17 MiB > 16 MiB cap.
+        let chunk = Bytes::from(vec![0u8; 1024 * 1024]);
+        let chunks: Vec<Result<Bytes, std::io::Error>> =
+            (0..17).map(|_| Ok(chunk.clone())).collect();
+        let raw = futures::stream::iter(chunks);
+
+        let mut bytes_so_far: usize = 0;
+        let mut mapped = raw.map(move |item: Result<Bytes, std::io::Error>| match item {
+            Ok(chunk) => {
+                bytes_so_far = bytes_so_far.saturating_add(chunk.len());
+                if bytes_so_far > MAX_CUSTOM_PROVIDER_REQUEST_BYTES {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "request body exceeds 16 MiB on custom-provider streaming path",
+                    ))
+                } else {
+                    Ok::<Bytes, std::io::Error>(chunk)
+                }
+            }
+            Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+        });
+
+        let mut saw_err = false;
+        while let Some(item) = mapped.next().await {
+            if item.is_err() {
+                saw_err = true;
+                break;
+            }
+        }
+        assert!(
+            saw_err,
+            "stream must emit Err once cumulative bytes exceed the cap"
+        );
+
+        // Also verify the cap is what we documented.
+        assert_eq!(MAX_CUSTOM_PROVIDER_REQUEST_BYTES, 16 * 1024 * 1024);
     }
 }

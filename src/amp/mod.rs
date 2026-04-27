@@ -11,6 +11,7 @@
 pub mod fallback_handlers;
 pub mod gemini_bridge;
 pub mod model_mapping;
+pub mod prefixed_body;
 pub mod proxy;
 pub mod response_rewriter;
 pub mod routes;
