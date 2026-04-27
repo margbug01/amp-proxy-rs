@@ -62,6 +62,7 @@ pub async fn forward(
     let Some(proxy) = state.ampcode.clone() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
+    state.metrics.increment_billable();
 
     let (parts, body) = req.into_parts();
 
@@ -130,16 +131,30 @@ fn body_into_reqwest(body: axum::body::Body) -> reqwest::Body {
                 Ok::<Bytes, std::io::Error>(chunk)
             }
         }
-        Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+        Err(e) => Err(std::io::Error::other(e)),
     });
     reqwest::Body::wrap_stream(stream)
 }
 
 fn sanitize_request_headers(src: &HeaderMap, upstream_api_key: Option<&str>) -> HeaderMap {
+    let connection_headers: Vec<&str> = src
+        .get_all(http::header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .collect();
+
     let mut out = HeaderMap::with_capacity(src.len());
     for (k, v) in src.iter() {
         let name = k.as_str();
-        if matches!(name, "host" | "content-length") || is_hop_by_hop(name) {
+        if is_sensitive_request_header(name)
+            || is_hop_by_hop(name)
+            || connection_headers
+                .iter()
+                .any(|connection_name| name.eq_ignore_ascii_case(connection_name))
+        {
             continue;
         }
         out.append(k.clone(), v.clone());
@@ -152,25 +167,88 @@ fn sanitize_request_headers(src: &HeaderMap, upstream_api_key: Option<&str>) -> 
     out
 }
 
+fn is_sensitive_request_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("authorization")
+        || name.eq_ignore_ascii_case("x-api-key")
+        || name.eq_ignore_ascii_case("proxy-authorization")
+        || name.eq_ignore_ascii_case("host")
+        || name.eq_ignore_ascii_case("content-length")
+}
+
 fn is_hop_by_hop(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "connection"
-            | "keep-alive"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "te"
-            | "trailers"
-            | "transfer-encoding"
-            | "upgrade"
-    )
+    name.eq_ignore_ascii_case("connection")
+        || name.eq_ignore_ascii_case("keep-alive")
+        || name.eq_ignore_ascii_case("proxy-authenticate")
+        || name.eq_ignore_ascii_case("proxy-authorization")
+        || name.eq_ignore_ascii_case("te")
+        || name.eq_ignore_ascii_case("trailers")
+        || name.eq_ignore_ascii_case("transfer-encoding")
+        || name.eq_ignore_ascii_case("upgrade")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use futures::stream;
+
+    #[test]
+    fn sanitize_request_headers_strips_local_auth_headers() {
+        let mut src = HeaderMap::new();
+        src.insert(http::header::AUTHORIZATION, "Bearer local".parse().unwrap());
+        src.insert("x-api-key", "local-key".parse().unwrap());
+        src.insert("x-safe-header", "keep-me".parse().unwrap());
+
+        let headers = sanitize_request_headers(&src, None);
+
+        assert!(!headers.contains_key(http::header::AUTHORIZATION));
+        assert!(!headers.contains_key("x-api-key"));
+        assert_eq!(headers["x-safe-header"], "keep-me");
+    }
+
+    #[test]
+    fn sanitize_request_headers_injects_upstream_bearer() {
+        let mut src = HeaderMap::new();
+        src.insert(http::header::AUTHORIZATION, "Bearer local".parse().unwrap());
+        src.insert("x-api-key", "local-key".parse().unwrap());
+
+        let headers = sanitize_request_headers(&src, Some("upstream-key"));
+
+        assert_eq!(headers[http::header::AUTHORIZATION], "Bearer upstream-key");
+        assert!(!headers.contains_key("x-api-key"));
+    }
+
+    #[test]
+    fn sanitize_request_headers_without_upstream_key_has_no_authorization() {
+        let mut src = HeaderMap::new();
+        src.insert(http::header::AUTHORIZATION, "Bearer local".parse().unwrap());
+
+        let headers = sanitize_request_headers(&src, None);
+
+        assert!(!headers.contains_key(http::header::AUTHORIZATION));
+    }
+
+    #[test]
+    fn sanitize_request_headers_strips_hop_by_hop_headers() {
+        let mut src = HeaderMap::new();
+        src.insert(http::header::HOST, "ampcode.com".parse().unwrap());
+        src.insert(http::header::CONTENT_LENGTH, "5".parse().unwrap());
+        src.insert(
+            http::header::CONNECTION,
+            "X-Remove-Me, keep-alive".parse().unwrap(),
+        );
+        src.insert("x-remove-me", "nope".parse().unwrap());
+        src.insert(http::header::TE, "trailers".parse().unwrap());
+        src.insert("x-safe-header", "keep-me".parse().unwrap());
+
+        let headers = sanitize_request_headers(&src, None);
+
+        assert!(!headers.contains_key(http::header::HOST));
+        assert!(!headers.contains_key(http::header::CONTENT_LENGTH));
+        assert!(!headers.contains_key(http::header::CONNECTION));
+        assert!(!headers.contains_key("x-remove-me"));
+        assert!(!headers.contains_key(http::header::TE));
+        assert_eq!(headers["x-safe-header"], "keep-me");
+    }
 
     /// The streaming bridge accepts an axum body and the chunks come out in
     /// the same order they went in. We can't introspect a `reqwest::Body`
@@ -199,7 +277,7 @@ mod tests {
                     Ok::<Bytes, std::io::Error>(chunk)
                 }
             }
-            Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+            Err(e) => Err(std::io::Error::other(e)),
         });
 
         let mut reassembled: Vec<u8> = Vec::new();

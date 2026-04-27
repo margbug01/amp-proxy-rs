@@ -26,7 +26,7 @@ pub struct PrefixedBody;
 impl PrefixedBody {
     /// Build a [`Body`] that yields `prefix` first, then the chunks from
     /// `tail`. An empty prefix is a transparent passthrough.
-    pub fn new(prefix: Bytes, tail: Body) -> Body {
+    pub fn build(prefix: Bytes, tail: Body) -> Body {
         if prefix.is_empty() {
             return tail;
         }
@@ -57,7 +57,7 @@ mod tests {
     async fn prefixed_body_yields_prefix_then_tail() {
         let prefix = Bytes::from_static(b"PREFIX:");
         let tail = Body::from("TAIL");
-        let combined = PrefixedBody::new(prefix, tail);
+        let combined = PrefixedBody::build(prefix, tail);
         assert_eq!(drain(combined).await, b"PREFIX:TAIL");
     }
 
@@ -65,7 +65,7 @@ mod tests {
     async fn empty_prefix_passes_through_tail_only() {
         let prefix = Bytes::new();
         let tail = Body::from("only-tail");
-        let combined = PrefixedBody::new(prefix, tail);
+        let combined = PrefixedBody::build(prefix, tail);
         assert_eq!(drain(combined).await, b"only-tail");
     }
 
@@ -73,7 +73,7 @@ mod tests {
     async fn empty_tail_yields_only_prefix() {
         let prefix = Bytes::from_static(b"hello");
         let tail = Body::empty();
-        let combined = PrefixedBody::new(prefix, tail);
+        let combined = PrefixedBody::build(prefix, tail);
         assert_eq!(drain(combined).await, b"hello");
     }
 }

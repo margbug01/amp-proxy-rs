@@ -26,10 +26,9 @@ pub fn generate_api_key() -> String {
 /// Hand-rolled base64 url-safe (RFC 4648 §5) encoder, no padding. Avoids
 /// pulling in an extra `base64` dependency given the `Cargo.toml` budget.
 fn encode_url_safe_no_pad(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
-    let mut out = String::with_capacity((bytes.len() * 4 + 2) / 3);
+    let mut out = String::with_capacity((bytes.len() * 4).div_ceil(3));
     let mut chunks = bytes.chunks_exact(3);
     for chunk in chunks.by_ref() {
         let n = ((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8) | (chunk[2] as u32);

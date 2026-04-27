@@ -67,15 +67,15 @@ impl ApiKeyValidator {
 
 /// Axum middleware that rejects requests lacking a recognised API key.
 ///
-/// `/healthz` is allow-listed so external probes don't need credentials.
+/// `/healthz` and `/metrics` are allow-listed so probes and Prometheus don't need credentials.
 pub async fn auth_middleware(
     State(state): State<SharedState>,
     req: Request<Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    // /healthz must stay reachable without credentials so external probes
-    // (Docker, Kubernetes, uptime monitors) don't need to know the API key.
-    if req.uri().path() == "/healthz" {
+    // /healthz and /metrics must stay reachable without credentials so
+    // external probes and Prometheus don't need to know the API key.
+    if matches!(req.uri().path(), "/healthz" | "/metrics") {
         return Ok(next.run(req).await);
     }
     match extract_key(&req) {
@@ -88,11 +88,7 @@ pub async fn auth_middleware(
 /// `Authorization: Bearer ...`. Returns `None` if neither yields a non-empty
 /// token.
 fn extract_key(req: &Request<Body>) -> Option<String> {
-    if let Some(v) = req
-        .headers()
-        .get("x-api-key")
-        .and_then(|v| v.to_str().ok())
-    {
+    if let Some(v) = req.headers().get("x-api-key").and_then(|v| v.to_str().ok()) {
         let trimmed = v.trim();
         if !trimmed.is_empty() {
             return Some(trimmed.to_string());

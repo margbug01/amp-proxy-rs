@@ -259,10 +259,7 @@ impl TranslatorState {
             Some(it) => it,
             None => return,
         };
-        let item_type = item
-            .get("type")
-            .and_then(|x| x.as_str())
-            .unwrap_or("");
+        let item_type = item.get("type").and_then(|x| x.as_str()).unwrap_or("");
         if item_type != "function_call" {
             return;
         }
@@ -301,18 +298,16 @@ impl TranslatorState {
         if delta.is_empty() {
             return None;
         }
-        Some(self.encode_chunk(
-            json!({
-                "candidates": [{
-                    "content": {
-                        "parts": [{"text": delta}],
-                        "role": "model",
-                    },
-                    "index": 0,
-                }],
-                "modelVersion": self.original_model,
-            }),
-        ))
+        Some(self.encode_chunk(json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{"text": delta}],
+                    "role": "model",
+                },
+                "index": 0,
+            }],
+            "modelVersion": self.original_model,
+        })))
     }
 
     fn handle_args_delta(&mut self, v: &Value) {
@@ -450,9 +445,7 @@ fn find_event_boundary(buf: &[u8]) -> Option<usize> {
 fn blank_line_len(buf: &[u8]) -> usize {
     if buf.starts_with(b"\r\n\r\n") {
         4
-    } else if buf.starts_with(b"\n\n") {
-        2
-    } else if buf.starts_with(b"\r\n") {
+    } else if buf.starts_with(b"\n\n") || buf.starts_with(b"\r\n") {
         2
     } else if buf.starts_with(b"\n") {
         1
@@ -465,9 +458,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Events we silently ignore (no Gemini equivalent, but well-known so we

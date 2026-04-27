@@ -71,9 +71,10 @@ impl FallbackHandler {
         let mapper = if cfg.model_mappings.is_empty() {
             None
         } else {
-            Some(ModelMapper::new(&cfg.model_mappings).map_err(|e| {
-                anyhow::anyhow!("compile ampcode.model-mappings regex: {e}")
-            })?)
+            Some(
+                ModelMapper::new(&cfg.model_mappings)
+                    .map_err(|e| anyhow::anyhow!("compile ampcode.model-mappings regex: {e}"))?,
+            )
         };
         Ok(Self {
             model_mapper: mapper,
@@ -160,8 +161,8 @@ impl FallbackHandler {
             // (non-streaming) and `:streamGenerateContent` are translated when
             // mode==translate; the bridge dispatches to the right translator.
             if is_google_native_path(path) {
-                let translatable = path.ends_with(":generateContent")
-                    || path.ends_with(":streamGenerateContent");
+                let translatable =
+                    path.ends_with(":generateContent") || path.ends_with(":streamGenerateContent");
                 if self.gemini_route_mode == "translate" && translatable {
                     return RouteDecision {
                         route_type: AmpRouteType::CustomProvider,
@@ -347,9 +348,7 @@ mod tests {
     }
 
     fn install(cfg: &AmpCode) -> TestGuard {
-        let g = SERIALISE_TESTS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let g = SERIALISE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         customproxy::global()
             .configure(&cfg.custom_providers)
             .expect("configure registry");
@@ -508,6 +507,25 @@ mod tests {
                 .as_deref(),
             Some("gpt-5.4")
         );
+    }
+
+    #[test]
+    fn duplicate_model_fails_over_to_second_provider() {
+        let cfg = cfg(
+            vec![provider("a", &["gpt-5.4"]), provider("b", &["gpt-5.4"])],
+            vec![],
+        );
+        let h = install(&cfg);
+        let body = br#"{"model":"gpt-5.4"}"#;
+        let d = h.decide("/v1/messages", body);
+        assert_eq!(d.route_type, AmpRouteType::CustomProvider);
+        assert_eq!(d.provider_name.as_deref(), Some("a"));
+
+        customproxy::global().record_failure("a", "first");
+        customproxy::global().record_failure("a", "second");
+        let d = h.decide("/v1/messages", body);
+        assert_eq!(d.route_type, AmpRouteType::CustomProvider);
+        assert_eq!(d.provider_name.as_deref(), Some("b"));
     }
 
     #[test]

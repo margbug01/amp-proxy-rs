@@ -68,6 +68,7 @@ impl AmpState {
     /// Build a new amp state with a freshly-configured reqwest client.
     pub fn new(module: Arc<AmpModule>) -> Self {
         let client = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
             .pool_idle_timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("build reqwest client");
@@ -92,10 +93,7 @@ pub fn build_router(state: AmpState) -> Router {
         .route("/api/provider/:provider/completions", any(handle))
         .route("/api/provider/:provider/responses", any(handle))
         // Gemini native: /v1beta/models/<model>:<action>
-        .route(
-            "/api/provider/:provider/v1beta/models/*action",
-            any(handle),
-        )
+        .route("/api/provider/:provider/v1beta/models/*action", any(handle))
         .route(
             "/api/provider/:provider/v1beta1/models/*action",
             any(handle),
@@ -115,14 +113,8 @@ pub fn build_router(state: AmpState) -> Router {
             "/api/provider/:provider/v1beta1/publishers/google/models/*action",
             any(handle),
         )
-        .route(
-            "/v1beta/publishers/google/models/*action",
-            any(handle),
-        )
-        .route(
-            "/v1beta1/publishers/google/models/*action",
-            any(handle),
-        )
+        .route("/v1beta/publishers/google/models/*action", any(handle))
+        .route("/v1beta1/publishers/google/models/*action", any(handle))
         // Bare provider-less alias paths.
         .route("/v1/chat/completions", any(handle))
         .route("/v1/completions", any(handle))
@@ -233,7 +225,7 @@ async fn handle(State(state): State<AmpState>, req: Request) -> Response {
                 let tail_owned = tail_opt
                     .take()
                     .expect("streaming branch invariant: tail still present");
-                let combined = PrefixedBody::new(prefix.clone(), tail_owned);
+                let combined = PrefixedBody::build(prefix.clone(), tail_owned);
                 dispatch_streaming(&state.client, &provider, &decision, &parts, combined).await
             } else {
                 // Buffered path: we already buffered if the prefix was
@@ -241,38 +233,43 @@ async fn handle(State(state): State<AmpState>, req: Request) -> Response {
                 let body_bytes = match buffered_full {
                     Some(b) => b,
                     None => {
-                        let tail_owned = tail_opt
-                            .take()
-                            .expect("buffered branch: tail still present when buffered_full is None");
+                        let tail_owned = tail_opt.take().expect(
+                            "buffered branch: tail still present when buffered_full is None",
+                        );
                         match drain_tail(
                             tail_owned,
                             MAX_BUFFERED_BYTES.saturating_sub(prefix.len()),
                         )
                         .await
                         {
-                        Ok(rest) => {
-                            let mut combined = Vec::with_capacity(prefix.len() + rest.len());
-                            combined.extend_from_slice(&prefix);
-                            combined.extend_from_slice(&rest);
-                            Bytes::from(combined)
-                        }
-                        Err(BufferError::TooLarge) => {
-                            warn!(method = %method, path = %path, "amp router: request body exceeds 16 MiB");
-                            return StatusCode::PAYLOAD_TOO_LARGE.into_response();
-                        }
-                        Err(BufferError::Read(e)) => {
-                            warn!(method = %method, path = %path, error = %e, "amp router: failed to read request body tail");
-                            return StatusCode::BAD_REQUEST.into_response();
-                        }
+                            Ok(rest) => {
+                                let mut combined = Vec::with_capacity(prefix.len() + rest.len());
+                                combined.extend_from_slice(&prefix);
+                                combined.extend_from_slice(&rest);
+                                Bytes::from(combined)
+                            }
+                            Err(BufferError::TooLarge) => {
+                                warn!(method = %method, path = %path, "amp router: request body exceeds 16 MiB");
+                                return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+                            }
+                            Err(BufferError::Read(e)) => {
+                                warn!(method = %method, path = %path, error = %e, "amp router: failed to read request body tail");
+                                return StatusCode::BAD_REQUEST.into_response();
+                            }
                         }
                     }
                 };
                 // Sanitise (remove unsigned thinking blocks etc.) on the
                 // buffered branch only — it requires the full body.
-                let sanitised =
-                    super::response_rewriter::sanitize_amp_request_body(&body_bytes);
-                dispatch_custom(state.client.clone(), &decision, &parts, Bytes::from(sanitised))
-                    .await
+                let sanitised = super::response_rewriter::sanitize_amp_request_body(&body_bytes);
+                dispatch_custom(
+                    state.client.clone(),
+                    &decision,
+                    &parts,
+                    Bytes::from(sanitised),
+                    provider_for_decision.clone(),
+                )
+                .await
             }
         }
         AmpRouteType::AmpCredits | AmpRouteType::LocalProvider | AmpRouteType::NoProvider => {
@@ -331,9 +328,7 @@ fn can_stream(
         // stream:true upgrade) which needs the full body.
         return false;
     }
-    if *method == http::Method::POST
-        && path.ends_with("/responses")
-        && provider.responses_translate
+    if *method == http::Method::POST && path.ends_with("/responses") && provider.responses_translate
     {
         return false;
     }
@@ -359,9 +354,8 @@ async fn split_prefix(body: Body, limit: usize) -> Result<(Bytes, Body), axum::E
                     // leftover slice back onto the tail stream.
                     buf.extend_from_slice(&chunk[..remaining]);
                     let leftover = chunk.slice(remaining..);
-                    let head = futures::stream::once(async move {
-                        Ok::<Bytes, axum::Error>(leftover)
-                    });
+                    let head =
+                        futures::stream::once(async move { Ok::<Bytes, axum::Error>(leftover) });
                     let tail = Body::from_stream(head.chain(stream));
                     return Ok((Bytes::from(buf), tail));
                 }
@@ -405,6 +399,7 @@ async fn dispatch_custom(
     decision: &RouteDecision,
     parts: &http::request::Parts,
     body: Bytes,
+    provider_for_decision: Option<Arc<Provider>>,
 ) -> Response {
     let provider_name = match &decision.provider_name {
         Some(n) => n.clone(),
@@ -414,7 +409,9 @@ async fn dispatch_custom(
     // Re-resolve the provider via the registry so we get the full Provider
     // (with request_overrides etc) rather than just the URL/key from the
     // decision.
-    let provider = match customproxy::global().provider_for_model(&decision.resolved_model) {
+    let provider = match provider_for_decision
+        .or_else(|| customproxy::global().provider_for_model(&decision.resolved_model))
+    {
         Some(p) => p,
         None => {
             warn!(model = %decision.resolved_model, "custom provider vanished between decide and dispatch");
@@ -589,7 +586,9 @@ mod tests {
         let body = Body::from(Bytes::from_static(b"abc"));
         let (prefix, tail) = split_prefix(body, PEEK_LIMIT).await.unwrap();
         assert_eq!(&prefix[..], b"abc");
-        let rest = drain_tail(tail, MAX_BUFFERED_BYTES).await.unwrap_or_default();
+        let rest = drain_tail(tail, MAX_BUFFERED_BYTES)
+            .await
+            .unwrap_or_default();
         assert_eq!(rest.len(), 0);
     }
 
@@ -607,15 +606,18 @@ mod tests {
 
     #[tokio::test]
     async fn peek_prefix_finds_model_in_first_chunk() {
-        let g = SERIALISE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
-        let cfg = cfg(vec![provider("gw", &["gpt-5.4"])], vec![]);
-        customproxy::global()
-            .configure(&cfg.custom_providers)
-            .expect("configure registry");
-        let h = FallbackHandler::new(&cfg).expect("new handler");
+        let h = {
+            let _g = SERIALISE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+            let cfg = cfg(vec![provider("gw", &["gpt-5.4"])], vec![]);
+            customproxy::global()
+                .configure(&cfg.custom_providers)
+                .expect("configure registry");
+            FallbackHandler::new(&cfg).expect("new handler")
+        };
 
-        let body_bytes =
-            Bytes::from_static(br#"{"model":"gpt-5.4","messages":[{"role":"user","content":"hi"}]}"#);
+        let body_bytes = Bytes::from_static(
+            br#"{"model":"gpt-5.4","messages":[{"role":"user","content":"hi"}]}"#,
+        );
         let body = Body::from(body_bytes.clone());
 
         let (prefix, _tail) = split_prefix(body, PEEK_LIMIT).await.unwrap();
@@ -629,17 +631,18 @@ mod tests {
         let decision = h.decide("/v1/chat/completions", &prefix);
         assert_eq!(decision.route_type, AmpRouteType::CustomProvider);
         assert_eq!(decision.resolved_model, "gpt-5.4");
-        drop(g);
     }
 
     #[tokio::test]
     async fn peek_prefix_falls_back_to_full_buffer_when_model_at_end() {
-        let g = SERIALISE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
-        let cfg = cfg(vec![provider("gw", &["gpt-5.4"])], vec![]);
-        customproxy::global()
-            .configure(&cfg.custom_providers)
-            .expect("configure registry");
-        let h = FallbackHandler::new(&cfg).expect("new handler");
+        let h = {
+            let _g = SERIALISE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+            let cfg = cfg(vec![provider("gw", &["gpt-5.4"])], vec![]);
+            customproxy::global()
+                .configure(&cfg.custom_providers)
+                .expect("configure registry");
+            FallbackHandler::new(&cfg).expect("new handler")
+        };
 
         // Build a body whose `model` field lives well past PEEK_LIMIT. We
         // use a very long string field preceding the model field. The JSON
@@ -677,7 +680,6 @@ mod tests {
         let full_decision = h.decide("/v1/chat/completions", &combined);
         assert_eq!(full_decision.route_type, AmpRouteType::CustomProvider);
         assert_eq!(full_decision.resolved_model, "gpt-5.4");
-        drop(g);
     }
 
     #[test]
@@ -700,7 +702,12 @@ mod tests {
             gemini_translate: false,
         };
         assert!(!can_stream(&d, &p, "/v1/messages", &http::Method::POST));
-        assert!(can_stream(&d, &p, "/v1/chat/completions", &http::Method::POST));
+        assert!(can_stream(
+            &d,
+            &p,
+            "/v1/chat/completions",
+            &http::Method::POST
+        ));
     }
 
     #[test]
@@ -722,7 +729,12 @@ mod tests {
             provider_api_key: Some("k".into()),
             gemini_translate: false,
         };
-        assert!(!can_stream(&d, &p, "/v1/chat/completions", &http::Method::POST));
+        assert!(!can_stream(
+            &d,
+            &p,
+            "/v1/chat/completions",
+            &http::Method::POST
+        ));
     }
 
     #[test]

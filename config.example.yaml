@@ -63,6 +63,8 @@ ampcode:
   # Custom upstream providers — route specific models to a third-party
   # OpenAI-compatible endpoint instead of ampcode.com. Request body's
   # model field is matched against each provider's "models" list.
+  # Multiple providers may list the same model; amp-proxy uses the first
+  # healthy provider and fails over after consecutive transport failures.
   custom-providers: []
     # - name: "my-openai-compat"
     #   url: "http://host:port/v1"

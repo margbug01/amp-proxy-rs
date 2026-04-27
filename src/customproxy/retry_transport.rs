@@ -89,7 +89,11 @@ impl RetryTransport {
     /// Convenience wrapper that takes an async closure returning a `Response`
     /// directly. Useful when the caller already has a request future shape
     /// and just wants the retry loop.
-    pub async fn run_with_retry<F, Fut, T, E>(&self, mut op: F, classify: impl Fn(&E) -> bool) -> Result<T, E>
+    pub async fn run_with_retry<F, Fut, T, E>(
+        &self,
+        mut op: F,
+        classify: impl Fn(&E) -> bool,
+    ) -> Result<T, E>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T, E>>,

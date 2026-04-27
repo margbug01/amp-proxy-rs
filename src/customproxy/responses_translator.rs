@@ -168,7 +168,9 @@ fn translate_input_to_messages(input: &[Value], thinking_enabled: bool) -> Vec<V
     };
 
     for raw in input {
-        let Some(item) = raw.as_object() else { continue };
+        let Some(item) = raw.as_object() else {
+            continue;
+        };
         let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
         let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -330,7 +332,9 @@ fn extract_reasoning_text(item: &Map<String, Value>) -> String {
     };
     let mut buf = String::new();
     for raw in summary {
-        let Some(part) = raw.as_object() else { continue };
+        let Some(part) = raw.as_object() else {
+            continue;
+        };
         if let Some(s) = part.get("text").and_then(|v| v.as_str()) {
             if !s.is_empty() {
                 buf.push_str(s);
@@ -457,7 +461,10 @@ pub fn translate_chat_completion_to_responses(
     resp.insert("temperature".into(), Value::from(1.0));
     resp.insert("top_p".into(), Value::from(1.0));
     resp.insert("usage".into(), translate_chat_usage(chat_obj.get("usage")));
-    resp.insert("completed_at".into(), Value::from(chrono::Utc::now().timestamp()));
+    resp.insert(
+        "completed_at".into(),
+        Value::from(chrono::Utc::now().timestamp()),
+    );
     if !ctx.prompt_cache_key.is_empty() {
         resp.insert(
             "prompt_cache_key".into(),
@@ -503,7 +510,11 @@ pub(crate) fn translate_chat_usage(raw: Option<&Value>) -> Value {
     copy(&mut out, "output_tokens", "completion_tokens");
     copy(&mut out, "total_tokens", "total_tokens");
     copy(&mut out, "input_tokens_details", "prompt_tokens_details");
-    copy(&mut out, "output_tokens_details", "completion_tokens_details");
+    copy(
+        &mut out,
+        "output_tokens_details",
+        "completion_tokens_details",
+    );
     if out.is_empty() {
         return Value::Object(usage.clone());
     }

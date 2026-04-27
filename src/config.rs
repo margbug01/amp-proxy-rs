@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 
 use serde::Deserialize;
@@ -128,11 +128,17 @@ impl Config {
             }
         }
 
-        let mut seen_models: HashMap<String, usize> = HashMap::new();
+        let mut seen_provider_names: HashSet<String> = HashSet::new();
         for (i, p) in self.ampcode.custom_providers.iter().enumerate() {
             let prefix = format!("ampcode.custom-providers[{i}]");
-            if p.name.trim().is_empty() {
+            let name = p.name.trim().to_lowercase();
+            if name.is_empty() {
                 return Err(AppError::Config(format!("{prefix}.name must not be empty")));
+            }
+            if !seen_provider_names.insert(name.to_string()) {
+                return Err(AppError::Config(format!(
+                    "{prefix}.name duplicates an earlier custom provider name"
+                )));
             }
             validate_absolute_url(&p.url, &format!("{prefix}.url"))?;
             if p.models.is_empty() {
@@ -147,13 +153,6 @@ impl Config {
                         "{prefix}.models[{j}] must not be empty"
                     )));
                 }
-                let key = trimmed.to_lowercase();
-                if let Some(first) = seen_models.get(&key) {
-                    return Err(AppError::Config(format!(
-                        "{prefix}.models[{j}] duplicates model from ampcode.custom-providers[{first}]"
-                    )));
-                }
-                seen_models.insert(key, i);
             }
         }
         Ok(())
@@ -213,7 +212,7 @@ ampcode:
     }
 
     #[test]
-    fn rejects_duplicate_provider_models() {
+    fn allows_duplicate_provider_models() {
         let yaml = r#"
 port: 8317
 api-keys: ["x"]
@@ -227,6 +226,26 @@ ampcode:
       url: "https://b.example.com"
       api-key: "k2"
       models: ["GPT-5"]
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_duplicate_provider_names() {
+        let yaml = r#"
+port: 8317
+api-keys: ["x"]
+ampcode:
+  custom-providers:
+    - name: "a"
+      url: "https://a.example.com"
+      api-key: "k1"
+      models: ["gpt-5"]
+    - name: "a"
+      url: "https://b.example.com"
+      api-key: "k2"
+      models: ["gpt-5-mini"]
 "#;
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
         assert!(cfg.validate().is_err());

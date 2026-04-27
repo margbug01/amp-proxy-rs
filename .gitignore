@@ -7,3 +7,4 @@
 /capture
 /capture_outbound
 .DS_Store
+.ace-tool/

@@ -450,18 +450,15 @@ impl TranslatorState {
         let idx = tc.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
 
         // Insert state if not seen before.
-        let entry = self
-            .tool_calls
-            .entry(idx)
-            .or_insert_with(|| ToolCallState {
-                output_index: 0,
-                item_id: String::new(),
-                call_id: String::new(),
-                name: String::new(),
-                args_buf: String::new(),
-                opened: false,
-                closed: false,
-            });
+        let entry = self.tool_calls.entry(idx).or_insert_with(|| ToolCallState {
+            output_index: 0,
+            item_id: String::new(),
+            call_id: String::new(),
+            name: String::new(),
+            args_buf: String::new(),
+            opened: false,
+            closed: false,
+        });
 
         if !entry.opened {
             if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
@@ -939,8 +936,7 @@ mod tests {
             r#"{"choices":[{"delta":{"content":"hi"}}]}"#,
             r#"{"choices":[{"finish_reason":"stop","delta":{}}],"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9}}"#,
         ]);
-        let stream =
-            translate_chat_to_responses_stream(upstream, ResponsesTranslateCtx::default());
+        let stream = translate_chat_to_responses_stream(upstream, ResponsesTranslateCtx::default());
         let got = collect_all(Box::pin(stream)).await;
         let events = parse_events(&got);
         let completed = events

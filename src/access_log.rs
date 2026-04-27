@@ -19,7 +19,8 @@ use axum::extract::{Request, State};
 use axum::http::Method;
 use axum::middleware::Next;
 use axum::response::Response;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use futures::{stream, StreamExt};
 use tracing::info;
 
 /// Maximum body size to buffer for the model/stream peek. Larger bodies are
@@ -92,27 +93,66 @@ fn is_json_content_type(headers: &axum::http::HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
+/// Read at most `PEEK_LIMIT` bytes from the front of a request body and
+/// rebuild a body that yields those bytes followed by the unread tail.
+///
+/// `Ok((body, Some(prefix)))` means the original body ended within the limit,
+/// so `prefix` contains the complete body and may be parsed. `Ok((body, None))`
+/// means the body exceeded the limit; it is still reconstructed losslessly, but
+/// callers should skip parsing because only a prefix was inspected.
+async fn peek_body_prefix(body: Body) -> Result<(Body, Option<Bytes>), axum::Error> {
+    let mut body_stream = body.into_data_stream();
+    let mut prefix = BytesMut::new();
+
+    while prefix.len() < PEEK_LIMIT {
+        let Some(chunk) = body_stream.next().await else {
+            let bytes = prefix.freeze();
+            return Ok((Body::from(bytes.clone()), Some(bytes)));
+        };
+        let chunk = chunk?;
+        if prefix.len() + chunk.len() <= PEEK_LIMIT {
+            prefix.extend_from_slice(&chunk);
+        } else {
+            let prefix_len = PEEK_LIMIT - prefix.len();
+            prefix.extend_from_slice(&chunk[..prefix_len]);
+            let rest = chunk.slice(prefix_len..);
+            let rebuilt = stream::once(async move { Ok::<_, axum::Error>(prefix.freeze()) })
+                .chain(stream::once(async move { Ok::<_, axum::Error>(rest) }))
+                .chain(body_stream);
+            return Ok((Body::from_stream(rebuilt), None));
+        }
+    }
+
+    let Some(chunk) = body_stream.next().await else {
+        let bytes = prefix.freeze();
+        return Ok((Body::from(bytes.clone()), Some(bytes)));
+    };
+    let chunk = chunk?;
+    let rebuilt = stream::once(async move { Ok::<_, axum::Error>(prefix.freeze()) })
+        .chain(stream::once(async move { Ok::<_, axum::Error>(chunk) }))
+        .chain(body_stream);
+    Ok((Body::from_stream(rebuilt), None))
+}
+
 /// Buffer the request body up to `PEEK_LIMIT` bytes, parse it as JSON, and
 /// extract `model` / `stream`. Always returns a fully-reconstructed request
 /// so the downstream handler still sees the original bytes. If the body is
 /// larger than the cap we silently skip the peek.
 async fn peek_model_and_stream(req: Request) -> (Request, Option<(Option<String>, Option<bool>)>) {
     let (parts, body) = req.into_parts();
-    let bytes = match axum::body::to_bytes(body, PEEK_LIMIT).await {
-        Ok(b) => b,
+    let (body, complete) = match peek_body_prefix(body).await {
+        Ok(peeked) => peeked,
         Err(_) => {
-            // Either body too large or read error; rebuild an empty body and
-            // skip the peek. We can't recover the original stream once it's
-            // consumed, but oversized bodies are exactly the case the cap
-            // exists to protect.
+            // On a real body read error, keep the existing conservative
+            // behavior: the consumed prefix cannot be recovered.
             let req = Request::from_parts(parts, Body::empty());
             return (req, None);
         }
     };
 
-    let peeked = parse_model_and_stream(&bytes);
-    let req = Request::from_parts(parts, Body::from(bytes));
-    (req, Some(peeked))
+    let peeked = complete.map(|bytes| parse_model_and_stream(&bytes));
+    let req = Request::from_parts(parts, body);
+    (req, peeked)
 }
 
 /// Parse the JSON body and pull out `model` (string) and `stream` (bool).
@@ -177,6 +217,25 @@ mod tests {
 
         // The body must still be readable downstream.
         let bytes = axum::body::to_bytes(rebuilt.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], &body[..]);
+    }
+
+    #[tokio::test]
+    async fn peek_skips_oversized_body_but_rebuilds_it_intact() {
+        let body: Vec<u8> = (0..PEEK_LIMIT + 17).map(|i| (i % 251) as u8).collect();
+        let req: Request = HttpRequest::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(body.clone()))
+            .unwrap();
+
+        let (rebuilt, peeked) = peek_model_and_stream(req).await;
+        assert!(peeked.is_none());
+
+        let bytes = axum::body::to_bytes(rebuilt.into_body(), PEEK_LIMIT + 32)
             .await
             .unwrap();
         assert_eq!(&bytes[..], &body[..]);

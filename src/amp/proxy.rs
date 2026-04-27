@@ -34,8 +34,8 @@ use tracing::{info, warn};
 pub use crate::proxy::{forward as forward_to_ampcode, AmpcodeProxy};
 
 use crate::customproxy::{
-    extract_leaf, responses_stream_translator, responses_translator, sse_messages_collapser,
-    Provider,
+    extract_leaf, responses_stream_translator, responses_translator,
+    retry_transport::RetryTransport, sse_messages_collapser, Provider,
 };
 
 /// Hard cap on bytes streamed through the custom-provider streaming path
@@ -43,6 +43,10 @@ use crate::customproxy::{
 /// limit; surfaced as an `io::Error` on the wrapped stream so reqwest
 /// fails the upload cleanly rather than buffering the lot.
 const MAX_CUSTOM_PROVIDER_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+
+/// Hard cap on non-streaming upstream response bodies that must be fully
+/// buffered for translation.
+const MAX_CUSTOM_PROVIDER_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Forward a buffered request to a custom upstream provider.
 ///
@@ -89,7 +93,9 @@ pub async fn forward_to_custom_provider(
                 send_body = bytes;
                 upgraded_messages = upgraded;
             }
-            Err(e) => warn!(error = %e, "customproxy: /messages body mutation failed; forwarding as-is"),
+            Err(e) => {
+                warn!(error = %e, "customproxy: /messages body mutation failed; forwarding as-is")
+            }
         }
     }
 
@@ -99,13 +105,13 @@ pub async fn forward_to_custom_provider(
         match responses_translator::translate_responses_request_to_chat(&send_body) {
             Ok((bytes, ctx)) => {
                 send_body = Bytes::from(bytes);
-                upstream_path = upstream_path
-                    .trim_end_matches("/responses")
-                    .to_string()
-                    + "/chat/completions";
+                upstream_path =
+                    upstream_path.trim_end_matches("/responses").to_string() + "/chat/completions";
                 translate_ctx = Some(ctx);
             }
-            Err(e) => warn!(error = %e, "customproxy: responses→chat translation failed; forwarding as-is"),
+            Err(e) => {
+                warn!(error = %e, "customproxy: responses→chat translation failed; forwarding as-is")
+            }
         }
     }
     let translate_responses = translate_ctx.is_some();
@@ -131,18 +137,30 @@ pub async fn forward_to_custom_provider(
         "customproxy: forwarding"
     );
 
-    let mut req = client.request(reqwest_method(&method), &url);
     let outbound_headers = sanitize_headers(
         headers,
         &provider.api_key,
         upgraded_messages || translate_responses,
     );
-    req = req.headers(outbound_headers);
-    let upstream = req
-        .body(send_body.clone())
-        .send()
+    let retry = RetryTransport::new(client.clone());
+    let upstream = match retry
+        .send_with_retry(|| {
+            client
+                .request(reqwest_method(&method), &url)
+                .headers(outbound_headers.clone())
+                .body(send_body.clone())
+        })
         .await
-        .with_context(|| format!("upstream request to {url}"))?;
+    {
+        Ok(resp) => {
+            crate::customproxy::global().record_success(&provider.name);
+            resp
+        }
+        Err(err) => {
+            crate::customproxy::global().record_failure(&provider.name, err.to_string());
+            return Err(err).with_context(|| format!("upstream request to {url}"));
+        }
+    };
 
     let status = upstream.status();
     let upstream_headers = upstream.headers().clone();
@@ -156,7 +174,7 @@ pub async fn forward_to_custom_provider(
     if upgraded_messages && ct.contains("text/event-stream") {
         let stream = upstream
             .bytes_stream()
-            .map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
+            .map(|r| r.map_err(std::io::Error::other));
         match sse_messages_collapser::collapse_to_json(Box::pin(stream)).await {
             Ok(collapsed) => {
                 return Ok(json_response(status, collapsed));
@@ -176,9 +194,11 @@ pub async fn forward_to_custom_provider(
         if ct.contains("text/event-stream") {
             let upstream_stream = upstream
                 .bytes_stream()
-                .map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
-            let translated =
-                responses_stream_translator::translate_chat_to_responses_stream(upstream_stream, ctx);
+                .map(|r| r.map_err(std::io::Error::other));
+            let translated = responses_stream_translator::translate_chat_to_responses_stream(
+                upstream_stream,
+                ctx,
+            );
             let mut response = Response::builder().status(status);
             {
                 let h = response
@@ -199,7 +219,9 @@ pub async fn forward_to_custom_provider(
         }
         // Non-SSE JSON reply (or error). Translate the chat completion JSON
         // back into Responses shape; if translation no-ops, pass through.
-        let bytes = upstream.bytes().await.context("read upstream JSON body")?;
+        let bytes = read_limited(upstream, MAX_CUSTOM_PROVIDER_RESPONSE_BYTES)
+            .await
+            .context("read upstream JSON body")?;
         let (final_body, _translated) =
             responses_translator::translate_chat_completion_to_responses(&bytes, &ctx)
                 .unwrap_or_else(|e| {
@@ -272,13 +294,22 @@ pub async fn forward_to_custom_provider_streaming(
     let outbound_headers = sanitize_headers(headers, &provider.api_key, false);
     let upstream_body = body_into_reqwest_capped(body);
 
-    let upstream = client
+    let upstream = match client
         .request(reqwest_method(&method), &url)
         .headers(outbound_headers)
         .body(upstream_body)
         .send()
         .await
-        .with_context(|| format!("upstream request to {url}"))?;
+    {
+        Ok(resp) => {
+            crate::customproxy::global().record_success(&provider.name);
+            resp
+        }
+        Err(err) => {
+            crate::customproxy::global().record_failure(&provider.name, err.to_string());
+            return Err(err).with_context(|| format!("upstream request to {url}"));
+        }
+    };
 
     let status = upstream.status();
     let upstream_headers = upstream.headers().clone();
@@ -323,9 +354,29 @@ fn body_into_reqwest_capped(body: axum::body::Body) -> reqwest::Body {
                 Ok::<Bytes, std::io::Error>(chunk)
             }
         }
-        Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+        Err(e) => Err(std::io::Error::other(e)),
     });
     reqwest::Body::wrap_stream(stream)
+}
+
+async fn read_limited(upstream: reqwest::Response, limit: usize) -> anyhow::Result<Bytes> {
+    if upstream
+        .content_length()
+        .is_some_and(|len| len > limit as u64)
+    {
+        return Err(anyhow!("upstream response body exceeds {limit} bytes"));
+    }
+
+    let mut stream = upstream.bytes_stream();
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("read upstream response chunk")?;
+        if buf.len().saturating_add(chunk.len()) > limit {
+            return Err(anyhow!("upstream response body exceeds {limit} bytes"));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(buf))
 }
 
 /// Convert axum `http::Method` to reqwest's. They share the same underlying
@@ -389,10 +440,7 @@ fn apply_messages_mutations(
         return Ok((Bytes::new(), false));
     }
     let mut v: Value = serde_json::from_slice(body).context("parse /messages body")?;
-    let already_streaming = v
-        .get("stream")
-        .and_then(|s| s.as_bool())
-        .unwrap_or(false);
+    let already_streaming = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
     let mut upgraded = false;
     if let Some(obj) = v.as_object_mut() {
         if !already_streaming {
@@ -489,7 +537,7 @@ mod tests {
                     Ok::<Bytes, std::io::Error>(chunk)
                 }
             }
-            Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+            Err(e) => Err(std::io::Error::other(e)),
         });
 
         let mut reassembled: Vec<u8> = Vec::new();
@@ -530,7 +578,7 @@ mod tests {
                     Ok::<Bytes, std::io::Error>(chunk)
                 }
             }
-            Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+            Err(e) => Err(std::io::Error::other(e)),
         });
 
         let mut saw_err = false;

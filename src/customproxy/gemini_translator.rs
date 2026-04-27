@@ -98,8 +98,7 @@ pub fn translate_gemini_request_to_openai(body: &[u8], mapped_model: &str) -> Re
                 pending_call_ids.clear();
             }
             "model" => {
-                pending_call_ids =
-                    append_model_content(&mut input, &parts, &mut call_id_counter);
+                pending_call_ids = append_model_content(&mut input, &parts, &mut call_id_counter);
             }
             _ => {
                 let txt = collect_gemini_text(Some(&Value::Array(parts.clone())));
@@ -118,7 +117,9 @@ pub fn translate_gemini_request_to_openai(body: &[u8], mapped_model: &str) -> Re
     let mut tools: Vec<Value> = Vec::new();
     if let Some(raw_tools) = req_obj.get("tools").and_then(|v| v.as_array()) {
         for rt in raw_tools {
-            let Some(group) = rt.as_object() else { continue };
+            let Some(group) = rt.as_object() else {
+                continue;
+            };
             let Some(decls) = group.get("functionDeclarations").and_then(|v| v.as_array()) else {
                 continue;
             };
@@ -269,7 +270,11 @@ fn append_model_content(
     for p in parts {
         let Some(part) = p.as_object() else { continue };
         if let Some(fc) = part.get("functionCall").and_then(|v| v.as_object()) {
-            let name = fc.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let name = fc
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let args = fc
                 .get("args")
                 .cloned()
@@ -508,11 +513,9 @@ mod tests {
 
     #[test]
     fn request_with_tools_and_thinking_suffix() {
-        let out = translate_gemini_request_to_openai(
-            GEMINI_SINGLE_TURN.as_bytes(),
-            "gpt-5.4-mini(high)",
-        )
-        .unwrap();
+        let out =
+            translate_gemini_request_to_openai(GEMINI_SINGLE_TURN.as_bytes(), "gpt-5.4-mini(high)")
+                .unwrap();
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["model"], "gpt-5.4-mini", "suffix must be stripped");
         assert_eq!(v["reasoning"]["effort"], "high");

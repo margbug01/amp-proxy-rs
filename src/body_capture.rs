@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::HeaderMap;
+use axum::http::{header::CONTENT_LENGTH, HeaderMap};
 use axum::middleware::Next;
 use axum::response::Response;
 use bytes::Bytes;
@@ -53,6 +53,11 @@ pub async fn body_capture_layer(
     let path = parts.uri.path().to_string();
     let req_headers = parts.headers.clone();
 
+    if should_skip_by_content_length(&req_headers) {
+        let rebuilt = Request::from_parts(parts, body);
+        return next.run(rebuilt).await;
+    }
+
     let req_bytes = match axum::body::to_bytes(body, BUFFER_LIMIT).await {
         Ok(b) => b,
         Err(e) => {
@@ -69,6 +74,10 @@ pub async fn body_capture_layer(
     let response = next.run(rebuilt).await;
 
     let (resp_parts, resp_body) = response.into_parts();
+    if should_skip_by_content_length(&resp_parts.headers) {
+        return Response::from_parts(resp_parts, resp_body);
+    }
+
     let resp_bytes = match axum::body::to_bytes(resp_body, BUFFER_LIMIT).await {
         Ok(b) => b,
         Err(e) => {
@@ -77,53 +86,55 @@ pub async fn body_capture_layer(
         }
     };
 
-    if let Err(e) = write_capture_file(
-        &cfg.dir,
-        &method,
-        &path,
-        &req_headers,
-        &req_bytes,
-        resp_parts.status,
-        &resp_parts.headers,
-        &resp_bytes,
-    )
-    .await
-    {
+    let capture = CaptureRecord {
+        method: &method,
+        path: &path,
+        req_headers: &req_headers,
+        req_body: &req_bytes,
+        status: resp_parts.status,
+        resp_headers: &resp_parts.headers,
+        resp_body: &resp_bytes,
+    };
+    if let Err(e) = write_capture_file(&cfg.dir, capture).await {
         warn!(method = %method, path = %path, error = %e, "body_capture: write failed");
     }
 
     Response::from_parts(resp_parts, Body::from(resp_bytes))
 }
 
+struct CaptureRecord<'a> {
+    method: &'a axum::http::Method,
+    path: &'a str,
+    req_headers: &'a HeaderMap,
+    req_body: &'a Bytes,
+    status: axum::http::StatusCode,
+    resp_headers: &'a HeaderMap,
+    resp_body: &'a Bytes,
+}
+
 /// Build the capture file and write it. Returns the path written on success.
 async fn write_capture_file(
     dir: &std::path::Path,
-    method: &axum::http::Method,
-    path: &str,
-    req_headers: &HeaderMap,
-    req_body: &Bytes,
-    status: axum::http::StatusCode,
-    resp_headers: &HeaderMap,
-    resp_body: &Bytes,
+    capture: CaptureRecord<'_>,
 ) -> std::io::Result<PathBuf> {
     tokio::fs::create_dir_all(dir).await?;
 
     let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S-%3f").to_string();
-    let sanitized = sanitize_path(path);
-    let file_name = format!("{timestamp}-{method}-{sanitized}.log");
+    let sanitized = sanitize_path(capture.path);
+    let file_name = format!("{timestamp}-{}-{sanitized}.log", capture.method);
     let file_path = dir.join(file_name);
 
     let mut out = String::new();
     out.push_str("=== REQUEST ===\n");
-    out.push_str(&format!("{method} {path}\n"));
-    append_headers(&mut out, req_headers);
+    out.push_str(&format!("{} {}\n", capture.method, capture.path));
+    append_headers(&mut out, capture.req_headers);
     out.push('\n');
-    append_body(&mut out, req_body);
+    append_body(&mut out, capture.req_body);
     out.push_str("\n\n=== RESPONSE ===\n");
-    out.push_str(&format!("status: {}\n", status.as_u16()));
-    append_headers(&mut out, resp_headers);
+    out.push_str(&format!("status: {}\n", capture.status.as_u16()));
+    append_headers(&mut out, capture.resp_headers);
     out.push('\n');
-    append_body(&mut out, resp_body);
+    append_body(&mut out, capture.resp_body);
     out.push('\n');
 
     tokio::fs::write(&file_path, out).await?;
@@ -132,15 +143,38 @@ async fn write_capture_file(
 
 /// Append each header as `Name: value` on its own line. Non-UTF-8 values are
 /// rendered with [`String::from_utf8_lossy`] so capture never aborts on
-/// binary header data.
+/// binary header data. Sensitive header values are redacted.
 fn append_headers(buf: &mut String, headers: &HeaderMap) {
     for (name, value) in headers.iter() {
-        let v = match value.to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => String::from_utf8_lossy(value.as_bytes()).into_owned(),
+        let v = if is_sensitive_header(name.as_str()) {
+            "[REDACTED]".to_string()
+        } else {
+            match value.to_str() {
+                Ok(s) => s.to_string(),
+                Err(_) => String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            }
         };
         buf.push_str(&format!("{}: {}\n", name.as_str(), v));
     }
+}
+
+fn is_sensitive_header(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "authorization" | "x-api-key" | "proxy-authorization" | "cookie" | "set-cookie"
+    ) || name.contains("token")
+        || name.contains("key")
+        || name.contains("secret")
+        || name.contains("password")
+}
+
+fn should_skip_by_content_length(headers: &HeaderMap) -> bool {
+    headers
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .is_some_and(|len| len > BUFFER_LIMIT as u64)
 }
 
 /// Append the body, truncating beyond [`CAPTURE_TRUNCATE`] with a marker.
@@ -214,6 +248,89 @@ mod tests {
         append_body(&mut buf, &big);
         assert!(buf.contains("[... truncated, original was"));
         assert!(buf.len() >= CAPTURE_TRUNCATE);
+    }
+
+    #[test]
+    fn append_headers_redacts_sensitive_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer secret".parse().unwrap());
+        headers.insert("x-api-key", "api-secret".parse().unwrap());
+        headers.insert("proxy-authorization", "Basic secret".parse().unwrap());
+        headers.insert("cookie", "session=secret".parse().unwrap());
+        headers.insert("set-cookie", "session=secret".parse().unwrap());
+        headers.insert("x-custom-token", "token-secret".parse().unwrap());
+        headers.insert("x-client-key-id", "key-secret".parse().unwrap());
+        headers.insert("x-shared-secret", "shared-secret".parse().unwrap());
+        headers.insert("x-password-hint", "password-secret".parse().unwrap());
+        headers.insert("x-visible", "visible".parse().unwrap());
+
+        let mut buf = String::new();
+        append_headers(&mut buf, &headers);
+
+        assert!(buf.contains("authorization: [REDACTED]"));
+        assert!(buf.contains("x-api-key: [REDACTED]"));
+        assert!(buf.contains("proxy-authorization: [REDACTED]"));
+        assert!(buf.contains("cookie: [REDACTED]"));
+        assert!(buf.contains("set-cookie: [REDACTED]"));
+        assert!(buf.contains("x-custom-token: [REDACTED]"));
+        assert!(buf.contains("x-client-key-id: [REDACTED]"));
+        assert!(buf.contains("x-shared-secret: [REDACTED]"));
+        assert!(buf.contains("x-password-hint: [REDACTED]"));
+        assert!(buf.contains("x-visible: visible"));
+        assert!(!buf.contains("Bearer secret"));
+        assert!(!buf.contains("api-secret"));
+        assert!(!buf.contains("session=secret"));
+    }
+
+    #[test]
+    fn should_skip_by_content_length_only_when_explicitly_over_limit() {
+        let mut headers = HeaderMap::new();
+        assert!(!should_skip_by_content_length(&headers));
+
+        headers.insert(CONTENT_LENGTH, BUFFER_LIMIT.to_string().parse().unwrap());
+        assert!(!should_skip_by_content_length(&headers));
+
+        headers.insert(
+            CONTENT_LENGTH,
+            (BUFFER_LIMIT + 1).to_string().parse().unwrap(),
+        );
+        assert!(should_skip_by_content_length(&headers));
+
+        headers.insert(CONTENT_LENGTH, "not-a-number".parse().unwrap());
+        assert!(!should_skip_by_content_length(&headers));
+    }
+
+    #[tokio::test]
+    async fn request_content_length_over_limit_skips_capture_and_preserves_body() {
+        let dir = unique_temp_dir("request-content-length-skip");
+        let cfg = CaptureConfig {
+            path_substring: "/capture-me".to_string(),
+            dir: dir.clone(),
+        };
+
+        let app = Router::new()
+            .route(
+                "/capture-me",
+                post(|body: Bytes| async move { (StatusCode::OK, body) }),
+            )
+            .layer(from_fn_with_state(cfg, body_capture_layer));
+
+        let req: Request = HttpRequest::builder()
+            .method("POST")
+            .uri("/capture-me")
+            .header(CONTENT_LENGTH, (BUFFER_LIMIT + 1).to_string())
+            .body(Body::from("still forwarded"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(body, Bytes::from_static(b"still forwarded"));
+
+        let count = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(count, 0, "content-length skip should not capture a file");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

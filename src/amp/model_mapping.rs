@@ -115,10 +115,7 @@ mod tests {
     #[test]
     fn regex_match() {
         let m = ModelMapper::new(&[rule("^gpt-5.*$", "gemini-2.5-pro", true)]).unwrap();
-        assert_eq!(
-            m.apply("gpt-5-turbo").as_deref(),
-            Some("gemini-2.5-pro")
-        );
+        assert_eq!(m.apply("gpt-5-turbo").as_deref(), Some("gemini-2.5-pro"));
     }
 
     #[test]
@@ -147,10 +144,7 @@ mod tests {
         // Exact wins for the bare key.
         assert_eq!(m.apply("gpt-5").as_deref(), Some("claude-sonnet-4"));
         // Regex still works for inputs the exact map doesn't cover.
-        assert_eq!(
-            m.apply("gpt-5-mini").as_deref(),
-            Some("gemini-2.5-pro")
-        );
+        assert_eq!(m.apply("gpt-5-mini").as_deref(), Some("gemini-2.5-pro"));
     }
 
     #[test]

@@ -155,8 +155,9 @@ pub fn collapse_bytes(raw: &[u8]) -> Result<Bytes, io::Error> {
                         }
                     }
                     "input_json_delta" => {
-                        if let Some(s) =
-                            parsed.pointer("/delta/partial_json").and_then(|v| v.as_str())
+                        if let Some(s) = parsed
+                            .pointer("/delta/partial_json")
+                            .and_then(|v| v.as_str())
                         {
                             current_partial_json.push_str(s);
                         }
@@ -217,13 +218,10 @@ pub fn collapse_bytes(raw: &[u8]) -> Result<Bytes, io::Error> {
                 // SSE keepalives and blank event markers.
             }
             "error" => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!(
-                        "upstream stream error: {}",
-                        std::str::from_utf8(payload).unwrap_or("<non-utf8>")
-                    ),
-                ));
+                return Err(io::Error::other(format!(
+                    "upstream stream error: {}",
+                    std::str::from_utf8(payload).unwrap_or("<non-utf8>")
+                )));
             }
             _ => {}
         }
@@ -245,17 +243,14 @@ pub fn collapse_bytes(raw: &[u8]) -> Result<Bytes, io::Error> {
         )
     })?;
     env.insert("content".into(), Value::Array(content));
-    let bytes = serde_json::to_vec(&Value::Object(env))
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let bytes = serde_json::to_vec(&Value::Object(env)).map_err(io::Error::other)?;
     Ok(Bytes::from(bytes))
 }
 
 /// Wraps a byte stream into one that yields a single collapsed JSON body
 /// once the upstream stream ends. Useful as a `reqwest::Response` body
 /// adapter inside the customproxy ModifyResponse path.
-pub fn collapse_stream<S>(
-    stream: S,
-) -> Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>>
+pub fn collapse_stream<S>(stream: S) -> Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>>
 where
     S: Stream<Item = Result<Bytes, io::Error>> + Send + Unpin + 'static,
 {

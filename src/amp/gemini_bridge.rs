@@ -24,7 +24,11 @@ use futures::StreamExt;
 use serde_json::Value;
 use tracing::{info, warn};
 
-use crate::customproxy::Provider;
+use crate::customproxy::{retry_transport::RetryTransport, Provider};
+
+/// Hard cap on non-streaming upstream response bodies that must be fully
+/// buffered for Gemini translation.
+const MAX_GEMINI_BRIDGE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Forward a Gemini `:generateContent` or `:streamGenerateContent` request
 /// to a custom provider via the Gemini ↔ OpenAI Responses translator pair.
@@ -83,19 +87,31 @@ pub async fn forward_gemini_translated(
     } else {
         "application/json"
     };
-    let mut req = client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("Accept", accept);
-    let bearer = provider.api_key.trim();
-    if !bearer.is_empty() {
-        req = req.header("Authorization", format!("Bearer {bearer}"));
-    }
-    let upstream = req
-        .body(translated_body)
-        .send()
+    let outbound_body = Bytes::from(translated_body);
+    let retry = RetryTransport::new(client.clone());
+    let upstream = match retry
+        .send_with_retry(|| {
+            let mut req = client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .header("Accept", accept);
+            let bearer = provider.api_key.trim();
+            if !bearer.is_empty() {
+                req = req.header("Authorization", format!("Bearer {bearer}"));
+            }
+            req.body(outbound_body.clone())
+        })
         .await
-        .with_context(|| format!("upstream request to {url}"))?;
+    {
+        Ok(resp) => {
+            crate::customproxy::global().record_success(&provider.name);
+            resp
+        }
+        Err(err) => {
+            crate::customproxy::global().record_failure(&provider.name, err.to_string());
+            return Err(err).with_context(|| format!("upstream request to {url}"));
+        }
+    };
 
     let status = upstream.status();
     let upstream_headers = upstream.headers().clone();
@@ -105,11 +121,12 @@ pub async fn forward_gemini_translated(
         // translator and return as Gemini-shape SSE.
         let upstream_stream = upstream
             .bytes_stream()
-            .map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
-        let translated = crate::customproxy::gemini_stream_translator::translate_responses_sse_to_gemini(
-            upstream_stream,
-            original_model.to_string(),
-        );
+            .map(|r| r.map_err(std::io::Error::other));
+        let translated =
+            crate::customproxy::gemini_stream_translator::translate_responses_sse_to_gemini(
+                upstream_stream,
+                original_model.to_string(),
+            );
         let mut response = Response::builder().status(status_or_502(status));
         {
             let h = response
@@ -127,8 +144,7 @@ pub async fn forward_gemini_translated(
     }
 
     // Non-streaming path: read the full upstream body, translate to JSON.
-    let upstream_bytes = upstream
-        .bytes()
+    let upstream_bytes = read_limited(upstream, MAX_GEMINI_BRIDGE_RESPONSE_BYTES)
         .await
         .context("read upstream response body")?;
 
@@ -141,7 +157,11 @@ pub async fn forward_gemini_translated(
                 error = %e,
                 "gemini-translate: response translation failed; surfacing raw upstream body"
             );
-            return Ok(passthrough_response(status, &upstream_headers, upstream_bytes));
+            return Ok(passthrough_response(
+                status,
+                &upstream_headers,
+                upstream_bytes,
+            ));
         }
     };
 
@@ -168,11 +188,7 @@ fn passthrough_response(status: StatusCode, headers: &HeaderMap, bytes: Bytes) -
             let name = k.as_str().to_ascii_lowercase();
             if matches!(
                 name.as_str(),
-                "content-length"
-                    | "transfer-encoding"
-                    | "connection"
-                    | "keep-alive"
-                    | "upgrade"
+                "content-length" | "transfer-encoding" | "connection" | "keep-alive" | "upgrade"
             ) {
                 continue;
             }
@@ -181,6 +197,26 @@ fn passthrough_response(status: StatusCode, headers: &HeaderMap, bytes: Bytes) -
     }
     b.body(Body::from(bytes))
         .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+async fn read_limited(upstream: reqwest::Response, limit: usize) -> anyhow::Result<Bytes> {
+    if upstream
+        .content_length()
+        .is_some_and(|len| len > limit as u64)
+    {
+        return Err(anyhow!("upstream response body exceeds {limit} bytes"));
+    }
+
+    let mut stream = upstream.bytes_stream();
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("read upstream response chunk")?;
+        if buf.len().saturating_add(chunk.len()) > limit {
+            return Err(anyhow!("upstream response body exceeds {limit} bytes"));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(buf))
 }
 
 fn status_or_502(s: StatusCode) -> StatusCode {
@@ -228,10 +264,7 @@ mod tests {
 
     #[test]
     fn status_demotes_informational() {
-        assert_eq!(
-            status_or_502(StatusCode::CONTINUE),
-            StatusCode::BAD_GATEWAY
-        );
+        assert_eq!(status_or_502(StatusCode::CONTINUE), StatusCode::BAD_GATEWAY);
         assert_eq!(status_or_502(StatusCode::OK), StatusCode::OK);
     }
 

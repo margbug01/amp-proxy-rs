@@ -41,7 +41,9 @@ pub fn run(args: InitArgs) -> anyhow::Result<()> {
     }
 
     println!("amp-proxy init — answer a few questions and a ready-to-run config will be written.");
-    println!("Values are echoed to the terminal; clear your shell history if the API key is sensitive.");
+    println!(
+        "Values are echoed to the terminal; clear your shell history if the API key is sensitive."
+    );
     println!();
 
     let stdin = io::stdin();
@@ -177,7 +179,7 @@ fn prompt_choice<R: BufRead>(
         if trimmed.is_empty() {
             return Ok(default_val.to_string());
         }
-        if lowered.iter().any(|c| *c == trimmed) {
+        if lowered.contains(&trimmed) {
             return Ok(trimmed);
         }
         println!("  invalid choice {trimmed:?}, must be one of {:?}", choices);
@@ -331,10 +333,7 @@ mod tests {
         // Smoke test that doesn't drive the interactive prompts. We use the
         // render path directly and write through the same helper run() does.
         let dir = std::env::temp_dir();
-        let path = dir.join(format!(
-            "amp-proxy-init-test-{}.yaml",
-            std::process::id()
-        ));
+        let path = dir.join(format!("amp-proxy-init-test-{}.yaml", std::process::id()));
         if path.exists() {
             fs::remove_file(&path).ok();
         }
@@ -353,7 +352,7 @@ mod tests {
             config: path.clone(),
             force: false,
         };
-        let err = run(args).err().expect("must refuse to overwrite");
+        let err = run(args).expect_err("must refuse to overwrite");
         assert!(err.to_string().contains("refusing to overwrite"));
 
         fs::remove_file(&path).ok();

@@ -25,9 +25,7 @@ use tracing::{error, warn};
 ///
 /// Returns a stream that yields the rewritten body chunks line-by-line so
 /// downstream clients still see incremental deltas as they arrive.
-pub fn rewrite_stream<S>(
-    stream: S,
-) -> Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>>
+pub fn rewrite_stream<S>(stream: S) -> Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>>
 where
     S: Stream<Item = Result<Bytes, io::Error>> + Send + Unpin + 'static,
 {
@@ -122,9 +120,7 @@ impl RewriterState {
                     return Bytes::copy_from_slice(line);
                 }
                 let mut patched = parsed;
-                if let Some(response) = patched
-                    .get_mut("response")
-                    .and_then(|v| v.as_object_mut())
+                if let Some(response) = patched.get_mut("response").and_then(|v| v.as_object_mut())
                 {
                     response.insert(
                         "output".into(),
