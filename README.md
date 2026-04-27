@@ -2,99 +2,94 @@
 
 # amp-proxy-rs
 
-**A focused Rust reverse proxy for [Sourcegraph Amp CLI](https://ampcode.com)**
+**专注于 [Sourcegraph Amp CLI](https://ampcode.com) 的 Rust 反向代理**
 
 [![CI](https://github.com/margbug01/amp-proxy-rs/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/margbug01/amp-proxy-rs/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange?logo=rust&logoColor=white)](Cargo.toml)
 [![Binary](https://img.shields.io/badge/binary-3.7%20MB-blue)](https://github.com/margbug01/amp-proxy-rs/releases)
 
-Route selected models to your own OpenAI-compatible providers, keep Amp control-plane traffic on ampcode.com, and watch every billable fallback.
+把指定 model 路由到你自己的 OpenAI 兼容网关，控制面流量保留给 ampcode.com，并清楚记录每一次 billable 兜底。
 
-[中文文档](README.zh-CN.md) · [Configuration example](config.example.yaml) · [Benchmarks](BENCHMARKS.md) · [Changelog](CHANGELOG.md)
+[English](README.en.md) · [配置示例](config.example.yaml) · [基准测试](BENCHMARKS.md) · [更新日志](CHANGELOG.md)
 
 </div>
 
 ---
 
-## What it does
+## 它解决什么问题
 
-`amp-proxy-rs` sits between Amp CLI and upstream model providers. It inspects the requested model, rewrites protocol shapes when needed, and sends model traffic to your own gateway while preserving ampcode.com fallback for control-plane APIs.
+`amp-proxy-rs` 位于 Amp CLI 和上游模型服务之间。它会读取请求里的 model，按配置决定走自定义网关还是 ampcode.com；必要时自动做协议翻译，让 Amp CLI 能稳定使用 OpenAI 兼容网关、DeepSeek、Gemini bridge 等路径。
 
-| Capability | What you get |
+| 能力 | 说明 |
 |---|---|
-| 🪶 Small release binary | LTO + strip + `opt-level = "z"`; no external runtime service required |
-| 🔀 Five protocol translators | Anthropic Messages, OpenAI Responses, chat/completions, Gemini `generateContent`, and Gemini streaming |
-| 🚿 Hybrid streaming | Peeks the first 16 KiB for routing, then streams the rest without buffering the whole request |
-| 🔁 Hot reload | API keys, model mappings, and provider routing update from `config.yaml`; host/port still require restart |
-| 🩺 Provider failover | Multiple providers can serve the same model; unhealthy primaries fail over and recover automatically |
-| 📈 Prometheus metrics | `/metrics` exposes request counters, latency histogram, and billable fallback counter |
-| 🧪 Tested paths | 159 unit tests plus real Amp CLI sessions for main agent, librarian, finder, and DeepSeek tool use |
+| 🪶 小体积 release 二进制 | LTO + strip + `opt-level = "z"`，无需额外运行时服务 |
+| 🔀 五个协议翻译器 | Anthropic Messages、OpenAI Responses、chat/completions、Gemini 非流式与流式 |
+| 🚿 混合流式转发 | 只 peek 前 16 KiB 做路由，后续 body 继续流式转发 |
+| 🔁 配置热重载 | API key、model mapping、provider 路由可热更新；监听地址变更仍需重启 |
+| 🩺 Provider failover | 同一个 model 可配置多个上游，主上游异常后自动切换，恢复后切回 |
+| 📈 Prometheus 指标 | `/metrics` 暴露请求数、耗时 histogram、billable 兜底计数 |
+| 🧪 覆盖验证 | 159 个单元测试，并用真实 Amp CLI 验证 main agent / librarian / finder / DeepSeek tool use |
 
 ---
 
-## Quick start
+## 快速开始
 
 ```bash
 git clone https://github.com/margbug01/amp-proxy-rs.git
 cd amp-proxy-rs
 
-# Build the optimized binary.
 cargo build --release
-
-# Generate a ready-to-run config.yaml interactively.
 ./target/release/amp-proxy init
-
-# Start the proxy.
 ./target/release/amp-proxy --config config.yaml
 ```
 
-Point Amp CLI at the proxy:
+把 Amp CLI 指向本代理：
 
 ```bash
 export AMP_URL=http://127.0.0.1:8317
-export AMP_API_KEY=<one of config.yaml api-keys>
+export AMP_API_KEY=<config.yaml 里的某个 api-keys>
 amp
 ```
 
-PowerShell:
+PowerShell：
 
 ```powershell
 $env:AMP_URL = "http://127.0.0.1:8317"
-$env:AMP_API_KEY = "<one of config.yaml api-keys>"
+$env:AMP_API_KEY = "<config.yaml 里的某个 api-keys>"
 amp
 ```
 
-On Windows, [`scripts/restart.ps1`](scripts/restart.ps1) provides a convenient restart + log redirection wrapper.
+Windows 下可以用 [`scripts/restart.ps1`](scripts/restart.ps1) 一键重启并重定向日志。
 
 ---
 
-## Architecture
+## 架构
 
 ```mermaid
 flowchart TD
     A[Amp CLI] -->|local API key| P[amp-proxy-rs]
-    P --> H[/healthz and /metrics/]
+    P --> H[/healthz 和 /metrics/]
     P --> R{model route?}
-    R -->|custom provider| C[OpenAI-compatible gateway]
+    R -->|custom provider| C[OpenAI 兼容网关]
     R -->|Gemini translate| G[Gemini ↔ OpenAI Responses bridge]
     R -->|fallback| B[ampcode.com BILLABLE]
-    C --> T1[Anthropic Messages SSE upgrade/collapse]
+    C --> T1[Anthropic Messages SSE 升级/折叠]
     C --> T2[Responses ↔ chat/completions]
     G --> T3[generateContent / streamGenerateContent]
 ```
 
-Important split:
+关键分工：
 
-- **Model traffic** can be routed to your own providers.
-- **Amp control-plane traffic** such as `/api/internal` and `/api/telemetry` still falls back to ampcode.com.
-- Every ampcode.com fallback emits a visible `BILLABLE` log line and increments `billable_requests_total`.
+- **模型流量** 可以转发到你自己的 provider。
+- **Amp 控制面流量**，例如 `/api/internal`、`/api/telemetry`，仍然兜底到 ampcode.com。
+- 每次 ampcode.com 兜底都会打 `BILLABLE` 日志，并增加 `billable_requests_total`。
 
 ---
 
-## Configuration
+## 配置
 
-Minimal `config.yaml`:
+最小 `config.yaml`：
 
 ```yaml
 host: "127.0.0.1"
@@ -105,7 +100,7 @@ api-keys:
 
 ampcode:
   upstream-url: "https://ampcode.com"
-  upstream-api-key: "" # optional Amp session token
+  upstream-api-key: "" # 可选 Amp session token
 
   custom-providers:
     - name: "primary-gateway"
@@ -114,9 +109,8 @@ ampcode:
       models:
         - "gpt-5.4"
         - "gpt-5.4-mini"
-      responses-translate: true # enable for chat/completions-only providers
+      responses-translate: true
 
-    # Optional backup for the same model. The first healthy provider wins.
     - name: "backup-gateway"
       url: "http://localhost:8001/v1"
       api-key: "backup-token"
@@ -131,109 +125,38 @@ ampcode:
   gemini-route-mode: "translate"
 ```
 
-See the fully commented [config.example.yaml](config.example.yaml) for every field.
+完整字段说明见 [config.example.yaml](config.example.yaml)。
 
 ---
 
-## Routing decisions
+## 路由决策
 
-| Step | Condition | Action |
+| 步骤 | 条件 | 动作 |
 |---|---|---|
-| 1 | Extract `model` from request body or Gemini URL path | Continue routing |
-| 2 | `force-model-mappings` / `model-mappings` match | Rewrite the upstream `model` field |
-| 3 | The resolved model appears in `custom-providers[*].models` | Send to the first healthy provider and inject its Bearer token |
-| 4 | Multiple providers serve the same model | Fail over after consecutive transport failures; switch back after health recovery |
-| 5 | Google Gemini path with `gemini-route-mode: translate` | Translate Gemini ↔ OpenAI Responses before forwarding |
-| 6 | Nothing matches | Fall back to ampcode.com and count as **billable** |
+| 1 | 从 body 或 Gemini URL path 提取 `model` | 进入路由判断 |
+| 2 | `force-model-mappings` / `model-mappings` 命中 | 改写上游请求里的 `model` 字段 |
+| 3 | 解析后的 model 出现在 `custom-providers[*].models` | 转发到第一个健康 provider，并注入 Bearer token |
+| 4 | 多个 provider 服务同一个 model | 连续传输失败后切到后备；探活恢复后切回主上游 |
+| 5 | Google Gemini 路径且 `gemini-route-mode: translate` | 先做 Gemini ↔ OpenAI Responses 翻译再转发 |
+| 6 | 以上都不命中 | 兜底到 ampcode.com，计为 **billable** |
 
 ---
 
-## Protocol translators
+## 可观测性
 
-| Translator | Purpose | File |
-|---|---|---|
-| Anthropic Messages SSE upgrade/collapse | Avoid content loss when upstream only behaves correctly as SSE | [`src/customproxy/sse_messages_collapser.rs`](src/customproxy/sse_messages_collapser.rs) |
-| Gemini ↔ OpenAI Responses | Finder `:generateContent` path | [`src/customproxy/gemini_translator.rs`](src/customproxy/gemini_translator.rs) |
-| Gemini streaming ↔ OpenAI Responses SSE | Finder `:streamGenerateContent` path | [`src/customproxy/gemini_stream_translator.rs`](src/customproxy/gemini_stream_translator.rs) |
-| OpenAI Responses ↔ chat/completions | DeepSeek and other chat-only upstreams | [`src/customproxy/responses_translator.rs`](src/customproxy/responses_translator.rs) |
-| OpenAI Responses SSE stream translator | Streaming response path for chat-only upstreams | [`src/customproxy/responses_stream_translator.rs`](src/customproxy/responses_stream_translator.rs) |
-
----
-
-## Observability
-
-### Logs
-
-Every Amp route emits a paired request/response trace:
-
-| Prefix | Meaning |
+| 信号 | 说明 |
 |---|---|
-| `amp router: request` | Routing decision, requested/resolved model, provider, stream mode |
-| `amp router: response` | Final status and elapsed time |
-| `customproxy: forwarding` | Actual custom-provider outbound request |
-| `gemini-translate: forwarding` | Gemini bridge path and stream mode |
-| `ampcode fallback: forwarding (BILLABLE — uses Amp credits)` | Request went to ampcode.com fallback |
-
-Useful checks:
+| 日志 | `amp router:*`、`customproxy: forwarding`、`gemini-translate: forwarding`、显式 `BILLABLE` 兜底行 |
+| 指标 | `/metrics` 暴露 `requests_total`、`request_duration_seconds`、`billable_requests_total` |
+| 抓包辅助 | `capture-pretty` 把 body capture 日志转换成结构化 JSON |
 
 ```bash
-# Model traffic accidentally reaching ampcode.com?
-grep BILLABLE run.log | grep -v "/api/internal\|/api/telemetry\|/news.rss"
-
-# Translator or upstream warnings
-grep WARN run.log
-```
-
-More verbose logs:
-
-```bash
-RUST_LOG=amp_proxy=debug,tower_http=info ./target/release/amp-proxy --config config.yaml
-```
-
-### Prometheus metrics
-
-`/metrics` is intentionally unauthenticated for local Prometheus scraping.
-
-| Metric | Meaning |
-|---|---|
-| `requests_total` | HTTP request count, excluding `/metrics` itself |
-| `request_duration_seconds` | Latency histogram, sum, and count |
-| `billable_requests_total` | Requests forwarded to ampcode.com fallback |
-
----
-
-## Debug body capture
-
-Debug middleware is disabled by default because captured bodies may contain prompts, tool calls, or secrets.
-
-```yaml
-debug:
-  access-log-model-peek: true
-  capture-path-substring: "/v1/responses"
-  capture-dir: "./capture"
-```
-
-Captured headers are redacted for common secret-bearing names. Bodies are preserved as-is, so use capture only on trusted machines.
-
-Convert a capture `.log` file into structured pretty JSON:
-
-```bash
-./target/release/amp-proxy capture-pretty ./capture/20260427-120000-000-POST-_v1_responses.log
 ./target/release/amp-proxy capture-pretty ./capture/in.log --output ./capture/in.pretty.json
 ```
 
-Output shape:
-
-```json
-{
-  "request": { "method": "POST", "path": "/v1/responses", "headers": {}, "body": {} },
-  "response": { "status": 200, "headers": {}, "body": {} }
-}
-```
-
 ---
 
-## Validation
+## 验证
 
 ```bash
 cargo fmt --check
@@ -241,42 +164,23 @@ cargo test --all-features --no-fail-fast
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-Current local result:
+当前本地结果：
 
 ```text
 test result: ok. 159 passed; 0 failed
 ```
 
-Benchmark notes live in [BENCHMARKS.md](BENCHMARKS.md). The current benchmark conclusion is that `simd-json` is slower for the drop-in compatible translator path, so `serde_json` remains the default.
+---
+
+## 友链
+
+- [LINUX DO](https://linux.do/) — 新的理想型社区。
 
 ---
 
-## Verified end-to-end paths
+## 致谢
 
-| Path | Verification |
-|---|---|
-| `claude-sonnet-4-6` main agent + librarian → custom upstream | 9 calls, all 200, zero WARN |
-| `gemini-3-flash-preview` finder → translated upstream | 17 calls, all 200, zero model-traffic BILLABLE fallback |
-| `gpt-5.4` → DeepSeek via Responses ↔ chat/completions | Multi-turn reasoning + tool use |
-| `/api/internal`, `/api/telemetry` → ampcode.com | Correct control-plane fallback |
-
----
-
-## Roadmap status
-
-The previous README roadmap items are now implemented:
-
-| Item | Status |
-|---|---|
-| Prometheus `/metrics` endpoint | ✅ Done |
-| Provider health checks + automatic failover | ✅ Done |
-| Body capture pretty-print tool | ✅ Done |
-
----
-
-## Credits
-
-The protocol translation algorithms and custom-provider routing model are derived from [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) under the MIT license. See [NOTICE.md](NOTICE.md) for attribution.
+协议翻译算法与 custom-provider 路由模型源自 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)，许可证为 MIT。归属信息见 [NOTICE.md](NOTICE.md)。
 
 ## License
 
