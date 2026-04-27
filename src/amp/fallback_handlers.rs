@@ -419,17 +419,22 @@ mod tests {
 
     #[test]
     fn gemini_translate_mode_routes_to_custom() {
-        let mut c = cfg(vec![provider("gw", &["gpt-5.4-mini"])], vec![]);
+        let mut c = cfg(
+            vec![provider("gw", &["deepseek-v4-flash"])],
+            vec![mapping("gemini-3.0-flash", "deepseek-v4-flash")],
+        );
         c.gemini_route_mode = "translate".into();
+        c.force_model_mappings = true;
         let h = install(&c);
         let body = b"";
         let d = h.decide(
-            "/api/provider/google/v1beta/models/gpt-5.4-mini:generateContent",
+            "/api/provider/google/v1beta/models/gemini-3.0-flash:generateContent",
             body,
         );
         assert_eq!(d.route_type, AmpRouteType::CustomProvider);
         assert!(d.gemini_translate);
-        assert_eq!(d.resolved_model, "gpt-5.4-mini");
+        assert_eq!(d.requested_model, "gemini-3.0-flash");
+        assert_eq!(d.resolved_model, "deepseek-v4-flash");
     }
 
     #[test]
@@ -488,6 +493,13 @@ mod tests {
             )
             .as_deref(),
             Some("gemini-3-flash-preview")
+        );
+        assert_eq!(
+            extract_gemini_model_from_path(
+                "/api/provider/google/v1beta1/publishers/google/models/gemini-3.0-flash:generateContent"
+            )
+            .as_deref(),
+            Some("gemini-3.0-flash")
         );
         assert!(extract_gemini_model_from_path("/api/provider/openai/v1/chat").is_none());
     }

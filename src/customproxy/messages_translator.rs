@@ -66,13 +66,14 @@ pub fn translate_responses_to_messages(body: &[u8]) -> Result<Vec<u8>> {
 
     let mut system_parts: Vec<String> = Vec::new();
     let mut messages: Vec<Value> = Vec::new();
+    let mut pending_assistant_blocks: Vec<Value> = Vec::new();
 
     for item in input {
         let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("");
         let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
         if role == "system" {
-            // Collect system text
+            flush_pending_assistant(&mut messages, &mut pending_assistant_blocks);
             let text = extract_text_from_content(item);
             if !text.is_empty() {
                 system_parts.push(text);
@@ -91,17 +92,15 @@ pub fn translate_responses_to_messages(body: &[u8]) -> Result<Vec<u8>> {
                     .unwrap_or("{}");
                 let args_val: Value =
                     serde_json::from_str(args_str).unwrap_or(Value::Object(Map::new()));
-                messages.push(json!({
-                    "role": "assistant",
-                    "content": [{
-                        "type": "tool_use",
-                        "id": call_id,
-                        "name": name,
-                        "input": args_val,
-                    }]
+                pending_assistant_blocks.push(json!({
+                    "type": "tool_use",
+                    "id": call_id,
+                    "name": name,
+                    "input": args_val,
                 }));
             }
             "function_call_output" => {
+                flush_pending_assistant(&mut messages, &mut pending_assistant_blocks);
                 let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
                 let output = item.get("output").and_then(|v| v.as_str()).unwrap_or("");
                 messages.push(json!({
@@ -114,17 +113,26 @@ pub fn translate_responses_to_messages(body: &[u8]) -> Result<Vec<u8>> {
                 }));
             }
             "message" => {
-                // type: "message" with nested content array
+                // type: "message" with nested content array. This must accept
+                // both user `input_text` and assistant `output_text`; otherwise
+                // Gemini/finder queries disappear on the Messages path.
                 let msg_role = item
                     .get("role")
                     .and_then(|v| v.as_str())
                     .unwrap_or("assistant");
-                let text = extract_message_output_text(item);
+                let text = extract_text_from_content(item);
                 if !text.is_empty() {
-                    messages.push(json!({
-                        "role": msg_role,
-                        "content": [{"type": "text", "text": text}]
-                    }));
+                    match msg_role {
+                        "assistant" => pending_assistant_blocks.push(json!({
+                            "type": "text",
+                            "text": text,
+                        })),
+                        "system" => system_parts.push(text),
+                        _ => {
+                            flush_pending_assistant(&mut messages, &mut pending_assistant_blocks);
+                            messages.push(text_message("user", text));
+                        }
+                    }
                 }
             }
             _ => {
@@ -132,14 +140,22 @@ pub fn translate_responses_to_messages(body: &[u8]) -> Result<Vec<u8>> {
                 let msg_role = if role.is_empty() { "user" } else { role };
                 let text = extract_text_from_content(item);
                 if !text.is_empty() {
-                    messages.push(json!({
-                        "role": msg_role,
-                        "content": [{"type": "text", "text": text}]
-                    }));
+                    match msg_role {
+                        "assistant" => pending_assistant_blocks.push(json!({
+                            "type": "text",
+                            "text": text,
+                        })),
+                        "system" => system_parts.push(text),
+                        _ => {
+                            flush_pending_assistant(&mut messages, &mut pending_assistant_blocks);
+                            messages.push(text_message("user", text));
+                        }
+                    }
                 }
             }
         }
     }
+    flush_pending_assistant(&mut messages, &mut pending_assistant_blocks);
 
     if !system_parts.is_empty() {
         out.insert("system".into(), Value::String(system_parts.join("\n")));
@@ -190,27 +206,18 @@ fn extract_text_from_content(item: &Value) -> String {
     String::new()
 }
 
-/// Extract text from a `type: "message"` output item's content array.
-fn extract_message_output_text(item: &Value) -> String {
-    let empty: Vec<Value> = Vec::new();
-    let parts = item
-        .get("content")
-        .and_then(|v| v.as_array())
-        .unwrap_or(&empty);
-    let mut buf = String::new();
-    for part in parts {
-        let t = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        if t == "output_text" || t == "text" {
-            let text = part.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            if !text.is_empty() {
-                if !buf.is_empty() {
-                    buf.push('\n');
-                }
-                buf.push_str(text);
-            }
-        }
+fn text_message(role: &str, text: String) -> Value {
+    json!({"role": role, "content": [{"type": "text", "text": text}]})
+}
+
+fn flush_pending_assistant(messages: &mut Vec<Value>, blocks: &mut Vec<Value>) {
+    if blocks.is_empty() {
+        return;
     }
-    buf
+    messages.push(json!({
+        "role": "assistant",
+        "content": std::mem::take(blocks),
+    }));
 }
 
 /// Convert a Responses tool to Anthropic tool shape.
@@ -912,6 +919,72 @@ mod tests {
     }
 
     #[test]
+    fn translate_request_preserves_user_message_input_text() {
+        let body = serde_json::to_vec(&json!({
+            "model": "deepseek-v4-flash",
+            "input": [
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "gemini_bridge implementation routes tests call chain"}
+                ]},
+            ],
+        }))
+        .unwrap();
+
+        let out = translate_responses_to_messages(&body).unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"][0]["type"], "text");
+        assert_eq!(
+            msgs[0]["content"][0]["text"],
+            "gemini_bridge implementation routes tests call chain"
+        );
+    }
+
+    #[test]
+    fn translate_request_groups_assistant_text_and_parallel_tool_uses() {
+        let body = serde_json::to_vec(&json!({
+            "model": "deepseek-v4-flash",
+            "input": [
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "Find the implementation"}
+                ]},
+                {"type": "message", "role": "assistant", "content": [
+                    {"type": "output_text", "text": "I'll inspect the code."}
+                ]},
+                {"type": "function_call", "call_id": "call_gf_0", "name": "glob", "arguments": "{\"filePattern\":\"src/**/*.rs\"}"},
+                {"type": "function_call", "call_id": "call_gf_1", "name": "Grep", "arguments": "{\"pattern\":\"gemini_bridge\"}"},
+                {"type": "function_call_output", "call_id": "call_gf_0", "output": "src/amp/gemini_bridge.rs"},
+                {"type": "function_call_output", "call_id": "call_gf_1", "output": "src/amp/routes.rs"},
+            ],
+        }))
+        .unwrap();
+
+        let out = translate_responses_to_messages(&body).unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+
+        assert_eq!(msgs.len(), 3, "msgs={msgs:#?}");
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"][0]["text"], "Find the implementation");
+        assert_eq!(msgs[1]["role"], "assistant");
+        let assistant_blocks = msgs[1]["content"].as_array().unwrap();
+        assert_eq!(assistant_blocks.len(), 3);
+        assert_eq!(assistant_blocks[0]["type"], "text");
+        assert_eq!(assistant_blocks[1]["type"], "tool_use");
+        assert_eq!(assistant_blocks[1]["id"], "call_gf_0");
+        assert_eq!(assistant_blocks[2]["type"], "tool_use");
+        assert_eq!(assistant_blocks[2]["id"], "call_gf_1");
+        assert_eq!(msgs[2]["role"], "user");
+        let result_blocks = msgs[2]["content"].as_array().unwrap();
+        assert_eq!(result_blocks.len(), 2);
+        assert_eq!(result_blocks[0]["tool_use_id"], "call_gf_0");
+        assert_eq!(result_blocks[1]["tool_use_id"], "call_gf_1");
+    }
+
+    #[test]
     fn translate_request_adds_missing_tool_result_immediately_after_tool_use() {
         let body = serde_json::to_vec(&json!({
             "model": "deepseek-v4-flash",
@@ -932,7 +1005,8 @@ mod tests {
         assert_eq!(msgs[2]["role"], "user");
         assert_eq!(msgs[2]["content"][0]["type"], "tool_result");
         assert_eq!(msgs[2]["content"][0]["tool_use_id"], "c1");
-        assert_eq!(msgs[3]["role"], "assistant");
+        assert_eq!(msgs[1]["content"][1]["type"], "text");
+        assert_eq!(msgs[1]["content"][1]["text"], "later text");
     }
 
     #[test]
