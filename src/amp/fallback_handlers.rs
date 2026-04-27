@@ -290,7 +290,7 @@ pub fn is_google_native_path(p: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AmpCode, CustomProvider, ModelMapping};
+    use crate::config::{AmpCode, CustomProvider, ModelAlias, ModelMapping};
     use serde_json::Map;
     use std::sync::Mutex;
 
@@ -306,6 +306,23 @@ mod tests {
             url: format!("https://{name}.example.com"),
             api_key: format!("key-{name}"),
             models: models.iter().map(|s| s.to_string()).collect(),
+            model_aliases: Vec::new(),
+            request_overrides: Map::new(),
+            responses_translate: false,
+            messages_translate: false,
+        }
+    }
+
+    fn provider_with_alias(name: &str, alias: &str, upstream: &str) -> CustomProvider {
+        CustomProvider {
+            name: name.into(),
+            url: format!("https://{name}.example.com"),
+            api_key: format!("key-{name}"),
+            models: Vec::new(),
+            model_aliases: vec![ModelAlias {
+                alias: alias.into(),
+                upstream: upstream.into(),
+            }],
             request_overrides: Map::new(),
             responses_translate: false,
             messages_translate: false,
@@ -397,6 +414,24 @@ mod tests {
         let d = h.decide("/v1/messages", body);
         assert_eq!(d.route_type, AmpRouteType::ModelMapping);
         assert_eq!(d.resolved_model, "gpt-5.4");
+        assert_eq!(d.provider_name.as_deref(), Some("gw"));
+    }
+
+    #[test]
+    fn model_mapping_can_target_provider_alias() {
+        let cfg = cfg(
+            vec![provider_with_alias(
+                "gw",
+                "opus-deepseek-anthropic",
+                "deepseek-v4-pro",
+            )],
+            vec![mapping("claude-opus-4-6", "opus-deepseek-anthropic")],
+        );
+        let h = install(&cfg);
+        let body = br#"{"model":"claude-opus-4-6"}"#;
+        let d = h.decide("/v1/messages", body);
+        assert_eq!(d.route_type, AmpRouteType::ModelMapping);
+        assert_eq!(d.resolved_model, "opus-deepseek-anthropic");
         assert_eq!(d.provider_name.as_deref(), Some("gw"));
     }
 

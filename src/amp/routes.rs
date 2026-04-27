@@ -332,7 +332,10 @@ fn can_stream(
     {
         return false;
     }
-    true
+    if provider.model_aliases.is_empty() && decision.route_type != AmpRouteType::ModelMapping {
+        return true;
+    }
+    false
 }
 
 /// Read up to `limit` bytes off `body` into a contiguous `Bytes` and return
@@ -418,12 +421,13 @@ async fn dispatch_custom(
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
+    let upstream_model = provider.upstream_model_for(&decision.resolved_model);
 
     if decision.gemini_translate {
         return match forward_gemini_translated(
             &provider,
             body,
-            &decision.resolved_model,
+            &upstream_model,
             &decision.requested_model,
             parts.uri.path(),
             &client,
@@ -438,10 +442,12 @@ async fn dispatch_custom(
         };
     }
 
-    // Standard custom-provider forward. If the body's model field needed
-    // rewriting (mapping case), do it here so we forward the resolved name.
-    let body = if decision.route_type == AmpRouteType::ModelMapping {
-        rewrite_model_in_body(&body, &decision.resolved_model)
+    // Standard custom-provider forward. If the body's model field needed rewriting
+    // (mapping or provider alias case), do it here so we forward the upstream name.
+    let body = if decision.route_type == AmpRouteType::ModelMapping
+        || upstream_model != decision.resolved_model.trim()
+    {
+        rewrite_model_in_body(&body, &upstream_model)
     } else {
         body
     };
@@ -533,7 +539,7 @@ fn bad_gateway(msg: String) -> Response {
 mod tests {
     use super::*;
     use crate::amp::fallback_handlers::{extract_model_from_request, FallbackHandler};
-    use crate::config::{AmpCode, CustomProvider, ModelMapping};
+    use crate::config::{AmpCode, CustomProvider, ModelAlias, ModelMapping};
     use bytes::Bytes;
     use serde_json::Map;
     use std::sync::Mutex;
@@ -548,6 +554,23 @@ mod tests {
             url: format!("https://{name}.example.com"),
             api_key: format!("key-{name}"),
             models: models.iter().map(|s| s.to_string()).collect(),
+            model_aliases: Vec::new(),
+            request_overrides: Map::new(),
+            responses_translate: false,
+            messages_translate: false,
+        }
+    }
+
+    fn provider_with_alias(name: &str, alias: &str, upstream: &str) -> CustomProvider {
+        CustomProvider {
+            name: name.into(),
+            url: format!("https://{name}.example.com"),
+            api_key: format!("key-{name}"),
+            models: Vec::new(),
+            model_aliases: vec![ModelAlias {
+                alias: alias.into(),
+                upstream: upstream.into(),
+            }],
             request_overrides: Map::new(),
             responses_translate: false,
             messages_translate: false,
@@ -573,6 +596,36 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["model"], "new");
         assert_eq!(v["x"], 1);
+    }
+
+    #[test]
+    fn provider_alias_routes_as_alias_but_rewrites_to_upstream_model() {
+        let cfg = cfg(
+            vec![provider_with_alias(
+                "gw",
+                "opus-deepseek-anthropic",
+                "deepseek-v4-pro",
+            )],
+            vec![],
+        );
+        let _g = SERIALISE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        customproxy::global()
+            .configure(&cfg.custom_providers)
+            .expect("configure registry");
+        let h = FallbackHandler::new(&cfg).expect("new handler");
+
+        let body = Bytes::from_static(br#"{"model":"opus-deepseek-anthropic","messages":[]}"#);
+        let d = h.decide("/v1/messages", &body);
+        assert_eq!(d.route_type, AmpRouteType::CustomProvider);
+        assert_eq!(d.resolved_model, "opus-deepseek-anthropic");
+
+        let p = customproxy::global()
+            .provider_for_model(&d.resolved_model)
+            .expect("provider");
+        let upstream_model = p.upstream_model_for(&d.resolved_model);
+        let out = rewrite_model_in_body(&body, &upstream_model);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["model"], "deepseek-v4-pro");
     }
 
     #[test]
@@ -690,6 +743,7 @@ mod tests {
             url: "http://x".into(),
             api_key: "k".into(),
             models: vec!["m".into()],
+            model_aliases: std::collections::HashMap::new(),
             request_overrides: Map::new(),
             responses_translate: false,
             messages_translate: false,
@@ -719,6 +773,7 @@ mod tests {
             url: "http://x".into(),
             api_key: "k".into(),
             models: vec!["m".into()],
+            model_aliases: std::collections::HashMap::new(),
             request_overrides: Map::new(),
             responses_translate: false,
             messages_translate: false,
@@ -747,6 +802,7 @@ mod tests {
             url: "http://x".into(),
             api_key: "k".into(),
             models: vec!["m".into()],
+            model_aliases: std::collections::HashMap::new(),
             request_overrides: Map::new(),
             responses_translate: true,
             messages_translate: false,

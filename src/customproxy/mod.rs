@@ -25,9 +25,8 @@ pub use extract_leaf::extract_leaf;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock};
 
-use arc_swap::ArcSwap;
-
 use crate::config::CustomProvider as ProviderCfg;
+use arc_swap::ArcSwap;
 
 /// A single configured upstream endpoint.
 #[derive(Debug, Clone)]
@@ -40,6 +39,8 @@ pub struct Provider {
     pub api_key: String,
     /// Models this provider serves (preserves original case for display).
     pub models: Vec<String>,
+    /// Local model alias -> upstream model name for this provider.
+    pub model_aliases: HashMap<String, String>,
     /// Shallow-merged JSON patch applied to every POST `/messages` body.
     pub request_overrides: serde_json::Map<String, serde_json::Value>,
     /// When true, OpenAI Responses requests are translated to/from
@@ -48,6 +49,32 @@ pub struct Provider {
     /// When true, requests on the Gemini bridge path are translated to
     /// Anthropic Messages format (`/v1/messages`) instead of OpenAI Responses.
     pub messages_translate: bool,
+}
+
+impl Provider {
+    /// Returns the provider-specific upstream model name for a local model id.
+    ///
+    /// If the alias itself is suffixed (`alias(high)`) and only the unsuffixed
+    /// alias is configured, the suffix is carried onto an unsuffixed upstream
+    /// model. Gemini bridge then strips that suffix into `reasoning.effort`.
+    pub fn upstream_model_for(&self, model: &str) -> String {
+        let trimmed = model.trim();
+        if let Some(upstream) = self.model_aliases.get(&model_lookup_key(trimmed)) {
+            return upstream.clone();
+        }
+
+        let base = strip_thinking_suffix(trimmed);
+        if base != trimmed {
+            if let Some(upstream) = self.model_aliases.get(&model_lookup_key(base)) {
+                if strip_thinking_suffix(upstream) == upstream {
+                    return format!("{upstream}{}", &trimmed[base.len()..]);
+                }
+                return upstream.clone();
+            }
+        }
+
+        trimmed.to_string()
+    }
 }
 
 /// Inner snapshot held inside the [`Registry`]'s [`ArcSwap`]. Reads see a
@@ -118,9 +145,12 @@ impl Registry {
             let name = c.name.trim();
             let url = c.url.trim();
 
-            if name.is_empty() || url.is_empty() || c.models.is_empty() {
+            if name.is_empty()
+                || url.is_empty()
+                || (c.models.is_empty() && c.model_aliases.is_empty())
+            {
                 return Err(format!(
-                    "custom provider {i} is invalid: name, url, and models are required"
+                    "custom provider {i} is invalid: name, url, and models/model-aliases are required"
                 ));
             }
             if !seen_names.insert(name.to_lowercase()) {
@@ -129,11 +159,21 @@ impl Registry {
                 ));
             }
 
+            let mut model_aliases = HashMap::with_capacity(c.model_aliases.len());
+            for alias in &c.model_aliases {
+                let local = alias.alias.trim();
+                let upstream = alias.upstream.trim();
+                if !local.is_empty() && !upstream.is_empty() {
+                    model_aliases.insert(model_lookup_key(local), upstream.to_string());
+                }
+            }
+
             let provider = Arc::new(Provider {
                 name: name.to_string(),
                 url: url.to_string(),
                 api_key: c.api_key.clone(),
                 models: c.models.clone(),
+                model_aliases,
                 request_overrides: c.request_overrides.clone(),
                 responses_translate: c.responses_translate,
                 messages_translate: c.messages_translate,
@@ -142,6 +182,20 @@ impl Registry {
 
             for model in &c.models {
                 let trimmed = model.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let key = model_lookup_key(trimmed);
+                by_model
+                    .entry(key.clone())
+                    .or_default()
+                    .push(provider.clone());
+                if active_model_keys.insert(key) {
+                    active_models.push(trimmed.to_string());
+                }
+            }
+            for alias in &c.model_aliases {
+                let trimmed = alias.alias.trim();
                 if trimmed.is_empty() {
                     continue;
                 }
@@ -322,6 +376,7 @@ mod tests {
             url: url.into(),
             api_key: "k".into(),
             models: models.iter().map(|s| s.to_string()).collect(),
+            model_aliases: Vec::new(),
             request_overrides: Map::new(),
             responses_translate: false,
             messages_translate: false,
@@ -407,6 +462,7 @@ mod tests {
                 url: "https://x".into(),
                 api_key: "k".into(),
                 models: vec!["m".into()],
+                model_aliases: Vec::new(),
                 request_overrides: Map::new(),
                 responses_translate: false,
                 messages_translate: false,
@@ -414,19 +470,21 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("invalid"));
 
-        // Empty models.
-        let err = r
-            .configure(&[ProviderCfg {
-                name: "n".into(),
-                url: "https://x".into(),
-                api_key: "k".into(),
-                models: vec![],
-                request_overrides: Map::new(),
-                responses_translate: false,
-                messages_translate: false,
-            }])
-            .unwrap_err();
-        assert!(err.contains("invalid"));
+        // Empty models are accepted when aliases are configured.
+        r.configure(&[ProviderCfg {
+            name: "n".into(),
+            url: "https://x".into(),
+            api_key: "k".into(),
+            models: vec![],
+            model_aliases: vec![crate::config::ModelAlias {
+                alias: "local".into(),
+                upstream: "upstream".into(),
+            }],
+            request_overrides: Map::new(),
+            responses_translate: false,
+            messages_translate: false,
+        }])
+        .unwrap();
     }
 
     #[test]
@@ -439,6 +497,58 @@ mod tests {
             ])
             .unwrap_err();
         assert!(err.contains("duplicates provider name"));
+    }
+
+    #[test]
+    fn aliases_register_for_lookup_and_rewrite_to_upstream() {
+        let r = Registry::new();
+        r.configure(&[ProviderCfg {
+            name: "a".into(),
+            url: "https://a.example.com".into(),
+            api_key: "k".into(),
+            models: Vec::new(),
+            model_aliases: vec![crate::config::ModelAlias {
+                alias: "opus-deepseek-anthropic".into(),
+                upstream: "deepseek-v4-pro".into(),
+            }],
+            request_overrides: Map::new(),
+            responses_translate: false,
+            messages_translate: false,
+        }])
+        .unwrap();
+
+        let provider = r.provider_for_model("OPUS-DEEPSEEK-ANTHROPIC").unwrap();
+        assert_eq!(provider.name, "a");
+        assert_eq!(
+            provider.upstream_model_for("opus-deepseek-anthropic"),
+            "deepseek-v4-pro"
+        );
+        assert_eq!(r.model_ids(), vec!["opus-deepseek-anthropic"]);
+    }
+
+    #[test]
+    fn alias_lookup_preserves_thinking_suffix_when_upstream_is_unsuffixed() {
+        let r = Registry::new();
+        r.configure(&[ProviderCfg {
+            name: "a".into(),
+            url: "https://a.example.com".into(),
+            api_key: "k".into(),
+            models: Vec::new(),
+            model_aliases: vec![crate::config::ModelAlias {
+                alias: "opus-alias".into(),
+                upstream: "deepseek-v4-pro".into(),
+            }],
+            request_overrides: Map::new(),
+            responses_translate: false,
+            messages_translate: false,
+        }])
+        .unwrap();
+
+        let provider = r.provider_for_model("opus-alias(high)").unwrap();
+        assert_eq!(
+            provider.upstream_model_for("opus-alias(high)"),
+            "deepseek-v4-pro(high)"
+        );
     }
 
     #[test]

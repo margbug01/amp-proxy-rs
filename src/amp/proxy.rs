@@ -82,13 +82,13 @@ pub async fn forward_to_custom_provider(
     let is_responses = leaf.ends_with("/responses") || leaf == "/responses";
 
     let mut upstream_path = String::from(leaf);
-    let mut send_body = body_bytes.clone();
+    let mut send_body = rewrite_body_model_for_provider(&body_bytes, provider);
     let mut upgraded_messages = false;
     let mut translate_ctx: Option<responses_translator::ResponsesTranslateCtx> = None;
 
     // /messages: shallow-merge overrides + (maybe) flip stream:true.
     if is_post && is_messages {
-        match apply_messages_mutations(&body_bytes, &provider.request_overrides) {
+        match apply_messages_mutations(&send_body, &provider.request_overrides) {
             Ok((bytes, upgraded)) => {
                 send_body = bytes;
                 upgraded_messages = upgraded;
@@ -455,6 +455,30 @@ fn apply_messages_mutations(
     Ok((Bytes::from(bytes), upgraded))
 }
 
+/// Rewrite the top-level `model` field through provider-local aliases.
+fn rewrite_body_model_for_provider(body: &Bytes, provider: &Provider) -> Bytes {
+    if provider.model_aliases.is_empty() || body.is_empty() {
+        return body.clone();
+    }
+    let mut v: Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return body.clone(),
+    };
+    let Some(obj) = v.as_object_mut() else {
+        return body.clone();
+    };
+    let Some(model) = obj.get("model").and_then(|m| m.as_str()) else {
+        return body.clone();
+    };
+    let upstream_model = provider.upstream_model_for(model);
+    if upstream_model == model.trim() {
+        return body.clone();
+    }
+
+    obj.insert("model".into(), Value::String(upstream_model));
+    Bytes::from(serde_json::to_vec(&v).unwrap_or_else(|_| body.to_vec()))
+}
+
 fn json_response(status: StatusCode, body: Bytes) -> Response {
     let len = body.len();
     let mut b = Response::builder().status(status);
@@ -487,6 +511,26 @@ mod tests {
         assert_eq!(v["stream"], true);
         assert_eq!(v["reasoning_effort"], "max");
         assert!(upgraded);
+    }
+
+    #[test]
+    fn provider_alias_rewrites_model() {
+        let mut aliases = std::collections::HashMap::new();
+        aliases.insert("opus-alias".into(), "deepseek-v4-pro".into());
+        let provider = Provider {
+            name: "p".into(),
+            url: "http://x".into(),
+            api_key: "k".into(),
+            models: Vec::new(),
+            model_aliases: aliases,
+            request_overrides: Map::new(),
+            responses_translate: false,
+            messages_translate: false,
+        };
+        let body = Bytes::from_static(br#"{"model":"opus-alias","messages":[]}"#);
+        let out = rewrite_body_model_for_provider(&body, &provider);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["model"], "deepseek-v4-pro");
     }
 
     #[test]

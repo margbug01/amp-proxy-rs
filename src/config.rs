@@ -66,6 +66,14 @@ pub struct ModelMapping {
     pub regex: bool,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[allow(dead_code)]
+pub struct ModelAlias {
+    pub alias: String,
+    pub upstream: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[allow(dead_code)]
@@ -73,7 +81,10 @@ pub struct CustomProvider {
     pub name: String,
     pub url: String,
     pub api_key: String,
+    #[serde(default)]
     pub models: Vec<String>,
+    #[serde(default)]
+    pub model_aliases: Vec<ModelAlias>,
     #[serde(default)]
     pub request_overrides: serde_json::Map<String, serde_json::Value>,
     #[serde(default)]
@@ -143,9 +154,9 @@ impl Config {
                 )));
             }
             validate_absolute_url(&p.url, &format!("{prefix}.url"))?;
-            if p.models.is_empty() {
+            if p.models.is_empty() && p.model_aliases.is_empty() {
                 return Err(AppError::Config(format!(
-                    "{prefix}.models must contain at least one model"
+                    "{prefix}.models or {prefix}.model-aliases must contain at least one model"
                 )));
             }
             for (j, m) in p.models.iter().enumerate() {
@@ -153,6 +164,18 @@ impl Config {
                 if trimmed.is_empty() {
                     return Err(AppError::Config(format!(
                         "{prefix}.models[{j}] must not be empty"
+                    )));
+                }
+            }
+            for (j, a) in p.model_aliases.iter().enumerate() {
+                if a.alias.trim().is_empty() {
+                    return Err(AppError::Config(format!(
+                        "{prefix}.model-aliases[{j}].alias must not be empty"
+                    )));
+                }
+                if a.upstream.trim().is_empty() {
+                    return Err(AppError::Config(format!(
+                        "{prefix}.model-aliases[{j}].upstream must not be empty"
                     )));
                 }
             }
@@ -231,6 +254,42 @@ ampcode:
 "#;
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn accepts_provider_with_only_model_aliases() {
+        let yaml = r#"
+port: 8317
+api-keys: ["x"]
+ampcode:
+  custom-providers:
+    - name: "a"
+      url: "https://a.example.com"
+      api-key: "k1"
+      model-aliases:
+        - alias: "opus-deepseek-anthropic"
+          upstream: "deepseek-v4-pro"
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_empty_model_alias() {
+        let yaml = r#"
+port: 8317
+api-keys: ["x"]
+ampcode:
+  custom-providers:
+    - name: "a"
+      url: "https://a.example.com"
+      api-key: "k1"
+      model-aliases:
+        - alias: ""
+          upstream: "deepseek-v4-pro"
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

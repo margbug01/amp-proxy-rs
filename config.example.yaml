@@ -72,6 +72,11 @@ ampcode:
     #   models:
     #     - "gpt-5.4"
     #     - "gpt-5.4-mini"
+    #   # Optional provider-local aliases. The alias is used for routing/model-mappings,
+    #   # while the upstream value is what amp-proxy sends in the request body.
+    #   # model-aliases:
+    #   #   - alias: "opus-deepseek-anthropic"
+    #   #     upstream: "deepseek-v4-pro"
     #   # For chat/completions-only upstreams such as https://api.deepseek.com:
     #   # responses-translate: true
     #   # For Anthropic Messages upstreams such as https://api.deepseek.com/anthropic:
