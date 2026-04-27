@@ -8,92 +8,69 @@ versioning follows [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [0.1.0] - 2026-04-27
 
-First Rust port. Functional parity with `../amp-proxy` (Go) on every
-data-plane code path that Amp CLI exercises, plus two additions the Go
-version does not have. See [NOTICE.md](NOTICE.md) for the full provenance
-chain and "additions beyond upstream" list.
+First release. End-to-end validated against a real Amp CLI session on
+Windows; 120 unit tests; 3.6 MB stripped release binary.
 
 ### Added
 
-- **Full Rust implementation** — 12 top-level modules, 28 source files,
-  120 unit tests (`cargo test`), 3.6 MB stripped release binary on
-  Windows x64 (LTO + opt-z + strip).
-- **Custom provider registry** with model-keyed routing, atomic hot-reload
-  via `arc_swap::ArcSwap`, case-insensitive lookup, thinking-suffix
-  fallback (`gpt-5.4-mini(high)` → `gpt-5.4-mini` for registry match).
-- **Three protocol translators** ported 1:1 from the Go version:
+- **HTTP server** — axum 0.7 + tokio multi-threaded runtime, graceful
+  Ctrl+C / SIGTERM shutdown, `/healthz` endpoint.
+- **API key authentication** — middleware accepting `x-api-key` or
+  `Authorization: Bearer <key>`, hot-reloadable from config.
+- **Custom provider registry** — model-keyed routing with atomic
+  hot-reload via `arc_swap::ArcSwap`, case-insensitive lookup,
+  thinking-suffix fallback (`gpt-5.4-mini(high)` → `gpt-5.4-mini` for
+  registry match).
+- **Five protocol translators**:
   - Anthropic `/v1/messages` non-streaming → SSE upgrade + collapse
-    (the `librarian` content-loss workaround)
-  - Gemini `:generateContent` ↔ OpenAI Responses (request + response)
-  - OpenAI Responses ↔ chat/completions (request + non-streaming reply)
-  - OpenAI Responses SSE → Responses SSE for chat/completions upstreams
-    (DeepSeek's `/v1/responses` translation path)
-- **Streaming Gemini translator** *(new beyond Go upstream)* —
-  `customproxy::gemini_stream_translator` translates an OpenAI Responses
-  SSE stream into Gemini `:streamGenerateContent` SSE chunks. The Go
-  version's `serveGeminiTranslate` returns false for this path and falls
-  through to ampcode.com; the Rust port keeps `finder` on custom
-  providers.
-- **AMP-CLI / Vertex AI path routes** *(new beyond Go upstream)* —
-  `/api/provider/<provider>/v1beta{,1}/publishers/google/models/*action`.
-  Without these, Amp CLI's `finder` requests silently fall through to
-  ampcode.com because the Go-style route table only covered the simpler
-  `/v1beta/models/<model>:<action>` shape.
+    (workaround for an upstream content-loss bug observed on the
+    `librarian` sub-agent path).
+  - Gemini `:generateContent` ↔ OpenAI Responses (request + response).
+  - Gemini `:streamGenerateContent` ↔ OpenAI Responses SSE (streaming
+    state machine).
+  - OpenAI Responses ↔ chat/completions (request + non-streaming reply).
+  - OpenAI Responses SSE → Responses SSE for chat-completions-only
+    upstreams (DeepSeek-style endpoints).
+- **AMP-CLI / Vertex AI path routing** — claims
+  `/api/provider/<provider>/v1beta{,1}/publishers/google/models/*action`
+  paths so Amp CLI's `finder` sub-agent stays on configured custom
+  providers instead of falling through to ampcode.com.
 - **`amp-proxy init` interactive wizard** — generates a ready-to-run
-  `config.yaml` with the 9-entry default model mapping table, random
+  `config.yaml` with a 9-entry default model mapping table, a random
   local API key, `force-model-mappings: true`, and
-  `gemini-route-mode: "translate"`. Match for Go upstream.
-- **Config hot-reload** — `mtime`-polled file watcher in `main::serve`
-  rebuilds the API key validator and the amp module's compiled
-  fallback handler atomically on every config save.
+  `gemini-route-mode: "translate"`.
+- **Config hot-reload** — mtime-polled file watcher rebuilds the API
+  key validator and the amp module's compiled fallback handler
+  atomically on every config save.
 - **Structured per-request logging**:
-  - `amp router: request` — INFO entry with method, path, body_bytes,
-    route decision, requested/resolved model, provider, gemini_translate
-    flag.
-  - `amp router: response` — paired entry with status code and elapsed_ms.
-  - `gemini-translate: forwarding` — per Gemini bridge call with stream
-    flag, in/out byte counts, target URL.
-  - `customproxy: forwarding` — per custom-provider call with
-    `upgraded_messages` and `translate_responses` flags.
-  - `ampcode fallback: forwarding (BILLABLE — uses Amp credits)` —
-    explicit warning whenever a request would consume Amp credits.
-    Surfaces credit drain immediately in `run.log`.
-- **`config.example.yaml`** + **`config.local.yaml`** — copied from the
-  Go parent, schema is wire-compatible (kebab-case keys, `serde(default)`
-  on all optional blocks).
+  - `amp router: request` / `amp router: response` paired INFO entries
+    with method, path, body bytes, route decision, requested/resolved
+    model, provider, gemini_translate flag, status, elapsed_ms.
+  - `gemini-translate: forwarding` per-bridge call with stream flag,
+    in/out byte counts, target URL.
+  - `customproxy: forwarding` per custom-provider call with
+    `upgraded_messages` / `translate_responses` flags.
+  - `ampcode fallback: forwarding (BILLABLE — uses Amp credits)`
+    explicit warning whenever a request consumes Amp credits.
+- **Retry transport** — wraps reqwest with single-retry on transient
+  transport errors (timeouts, connection resets, EOFs).
+- **`config.example.yaml`** — full schema reference with kebab-case keys
+  and `serde(default)` on every optional block.
 
-### Validated against real Amp CLI traffic
+### Validated
 
-End-to-end testing through a real Amp CLI session covered the four
+End-to-end testing through a real Amp CLI session covered four
 high-risk paths:
 
 | Path | Verdict |
 |---|---|
-| `claude-sonnet-4-6` (main agent + librarian) → augment-gpt | ✅ 9 calls, all 200, no warnings |
-| `gemini-3-flash-preview` (finder) → augment-gpt via translate | ✅ 17 calls, all 200, no credit leak |
-| `gpt-5.4` → DeepSeek via Responses↔chat/completions | ✅ many multi-turn reasoning + tool_use calls, all 200 |
+| `claude-sonnet-4-6` (main agent + librarian) → custom provider | ✅ 9 calls, all 200, no warnings |
+| `gemini-3-flash-preview` (finder) → custom provider via translate | ✅ 17 calls, all 200, no credit leak |
+| `gpt-5.4` → DeepSeek via Responses↔chat/completions | ✅ multi-turn reasoning + tool_use, all 200 |
 | `/api/internal`, `/api/telemetry` (Amp control plane) → ampcode.com | ✅ correctly billable (expected) |
 
-### Fixed (relative to the Go upstream)
+### Build
 
-- **Vertex path routing** — the Go gin router didn't claim the
-  `/publishers/google/models/...` variant Amp CLI sends to its `google`
-  provider; requests fell through to ampcode.com and consumed credits.
-  Added explicit routes in `amp::routes` and an extra
-  `extract_gemini_model_from_path` test case.
-- **`gemini_bridge` Accept/stream mismatch** — the initial Rust port
-  unconditionally sent `Accept: text/event-stream` on the upstream
-  request, but `translate_gemini_response` only parses single-JSON
-  bodies. `:generateContent` now requests `application/json` with
-  `stream: false`; only `:streamGenerateContent` keeps the SSE accept
-  header.
-
-### Not ported (deliberately)
-
-- `internal/access/`, `internal/handlers/`, `internal/registry/`,
-  `internal/modules/` — Go SDK plumbing for OAuth-managed providers that
-  amp-proxy-rs doesn't ship.
-- `scripts/test_gemini_translate.js` — replaced by in-process unit tests
-  in `customproxy::gemini_translator::tests`.
-- `internal/server/{access_log,body_capture}.go` — left as a pair of
-  "good Rust learning exercise" stubs (see README's 学习路线 section).
+- Release profile: `opt-level = "z"`, `lto = "fat"`, `codegen-units = 1`,
+  `strip = "symbols"`, `panic = "abort"`.
+- Resulting binary: 3.6 MB on Windows x64.
