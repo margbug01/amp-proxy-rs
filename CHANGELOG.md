@@ -6,6 +6,51 @@ versioning follows [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-04-27
+
+Adds the three operational features that were on the roadmap after v0.1.0:
+Prometheus `/metrics`, provider health checks with automatic failover, and a
+`capture-pretty` body-capture viewer. 159 unit tests pass.
+
+### Added
+
+- **Prometheus `/metrics` endpoint** — exposes `requests_total` (counter),
+  `request_duration_seconds` (histogram), and `billable_requests_total`
+  (counter, increments on every ampcode.com fallback). Wired via
+  `metrics_middleware` so every Amp CLI request feeds the histogram.
+- **Provider health checks + auto-failover** — multiple `custom-providers`
+  entries serving the same model are now tried in order; consecutive
+  upstream errors trip a per-provider `healthy = false` flag, the registry
+  routes around the unhealthy one, and a 30-second background probe to
+  `<provider>/v1/models` flips it healthy again on success. Implemented
+  via `customproxy::Registry::record_success / record_failure /
+  health_snapshots` and `main::provider_health_checker`.
+- **`amp-proxy capture-pretty` subcommand** — pretty-prints a
+  `body_capture` `.log` file as structured JSON (auto-detects
+  `application/json` request and response bodies and formats them).
+  Optional `--output <path>` writes to disk instead of stdout.
+- **Bilingual README** — Chinese primary (`README.md`), English mirror
+  (`README.en.md`).
+
+### Changed
+
+- `customproxy::Registry` internal layout changed from
+  `HashMap<model, Arc<Provider>>` to
+  `HashMap<model, Vec<Arc<Provider>>>` to support multiple providers per
+  model. Behaviour for single-provider setups is unchanged.
+- `gemini_bridge::forward_gemini_translated` now goes through
+  `RetryTransport::send_with_retry` and feeds health-tracking on every
+  attempt.
+- `proxy::sanitize_request_headers` now also strips any header listed
+  inside the inbound `Connection:` header value (per RFC 9110).
+- `config::validate` now rejects duplicate provider names but ALLOWS
+  duplicate models across providers (required for failover).
+
+### Fixed
+
+- Triple-emitted release notes when the matrix-parallel release jobs each
+  regenerated notes via `softprops/action-gh-release@v2`.
+
 ## [0.1.0] - 2026-04-27
 
 First release. End-to-end validated against a real Amp CLI session on
