@@ -1,10 +1,12 @@
 # amp-proxy-rs
 
+[![CI](https://github.com/margbug01/amp-proxy-rs/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/margbug01/amp-proxy-rs/actions/workflows/ci.yml)
+
 [Sourcegraph Amp CLI](https://ampcode.com) 的反向代理。把指定 model 路由到你自己
 搭的 OpenAI 兼容网关、做协议翻译、对未映射流量兜底回 ampcode.com。
 
-**Release 构建产物 3.6 MB**（Windows x64，开 LTO + strip + opt-z）；
-`cargo test` 共 **120 个单测全过**。
+**Release 构建产物 3.7 MB**（Windows x64，开 LTO + strip + opt-z）；
+`cargo test` 共 **130 个单测全过**。
 
 ## 为什么需要
 
@@ -177,7 +179,7 @@ RUST_LOG=amp_proxy=debug,tower_http=info ./target/release/amp-proxy --config con
 
 ```bash
 cargo test
-# test result: ok. 120 passed; 0 failed
+# test result: ok. 130 passed; 0 failed
 ```
 
 重点模块测试数量：
@@ -188,22 +190,39 @@ cargo test
 - `customproxy::responses_translator` — 字段映射、tool 翻译（7 个）
 - `customproxy::responses_stream_translator` — Responses SSE 翻译（3 个）
 - `amp::fallback_handlers` — 五种 RouteType 决策 + Vertex path 提取（10 个）
+- `auth` — ArcSwap 并发读 / 原子换值（3 个，含 4 reader + 1 writer 压测）
+- `proxy` — ampcode 兜底流式上行 + 64 MiB cap（2 个）
+- `access_log` / `body_capture` — middleware 行为（7 个）
 - `init` — 配置生成 + 解析往返（3 个）
+
+## 调试 middleware（可选，按需启用）
+
+两个零成本默认关闭的 middleware，按 `debug.*` 配置开启：
+
+```yaml
+debug:
+  # 在 INFO 日志里给每个请求加 "request log" 行，含 model/stream peek
+  access-log-model-peek: true
+
+  # 把指定路径的请求/响应 body 落盘到 ./capture/<timestamp>-<method>-<path>.log
+  capture-path-substring: "/v1/responses"
+  capture-dir: "./capture"
+```
+
+`access-log-model-peek` 只在 JSON POST/PUT 请求且 body ≤ 256 KiB 时才 peek；
+`body_capture` 在每个方向上限 2 MiB（超出会写截断标记），落盘失败仅 `warn`，不会破坏请求。
 
 ## 路线图 / Good first issues
 
-1. **流式上行** —— `src/proxy.rs::forward` 和 `src/amp/routes.rs::handle` 现在
-   `axum::body::to_bytes` 把请求体读到内存。换成 `impl Stream<Item = Bytes>` 真正的
-   流式转发，把内存占用从"按最大请求体"降到"按 chunk"。
+1. **`amp::routes::handle` 也做流式** —— 当前 `src/proxy.rs::forward`
+   （ampcode 兜底）已经流式上行，但 `src/amp/routes.rs::handle` 因为要 peek body
+   做模型决策，还是 buffer 16 MiB。可以拆成"buffer 头几 KB 看 model，然后剩下的流式拼接转发"
+   的混合策略——是个学 `http_body::Body` 自定义实现的硬题目。
 2. **零拷贝 JSON 路径访问** —— 所有 translator 走 `serde_json::Value` 反序列化。
-   引入 `simd-json` 或自己写一个 path-based 访问器，可显著减少大 body 时延。
-3. **替换 `Arc<RwLock>` 为 `arc_swap::ArcSwap`** —— `auth.rs` 现在用
-   `RwLock<HashSet>`，读路径每次都得 `.read()`，换成 `ArcSwap` 是经典优化（`customproxy::Registry`
-   已经这么做了）。
-4. **Capture middleware** —— `tower::Layer` 自定义 middleware 把请求/响应 body 写到磁盘
-   做调试。
-5. **`scripts/restart.ps1`** —— PowerShell 启停脚本（`taskkill` + 重启 + 重定向日志）。
-6. **CI workflow** —— `.github/workflows/ci.yml` 跑 `cargo test` + `cargo build --release`。
+   引入 `simd-json` 或自己写一个 path-based 访问器，比对 Go 版 `gjson` 在大 body
+   下的延迟差异。需要先建立 benchmark 基线。
+3. **`amp::proxy::forward_to_custom_provider` 流式上行** —— 同 #1，但路径已知不需要
+   peek body（用 `decision` 里已经决定好的 path leaf 转发即可），改造成本更低。
 
 ## License
 
