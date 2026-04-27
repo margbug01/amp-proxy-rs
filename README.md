@@ -1,127 +1,46 @@
+<div align="center">
+
 # amp-proxy-rs
 
+**专注的 [Sourcegraph Amp CLI](https://ampcode.com) 反向代理 · Rust 实现**
+
 [![CI](https://github.com/margbug01/amp-proxy-rs/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/margbug01/amp-proxy-rs/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange?logo=rust&logoColor=white)](Cargo.toml)
+[![Binary](https://img.shields.io/badge/binary-3.7%20MB-blue)](https://github.com/margbug01/amp-proxy-rs/releases)
 
-[Sourcegraph Amp CLI](https://ampcode.com) 的反向代理。把指定 model 路由到你自己
-搭的 OpenAI 兼容网关、做协议翻译、对未映射流量兜底回 ampcode.com。
+把指定 model 路由到你自己的 OpenAI 兼容网关 · 五个协议翻译器 · 混合流式转发 · 配置热重载
 
-**Release 构建产物 3.7 MB**（Windows x64，开 LTO + strip + opt-z）；
-`cargo test` 共 **130 个单测全过**。
+</div>
 
-## 为什么需要
+---
 
-把 Amp CLI 指向你自己的网关而不是 `ampcode.com`，你能决定用哪个 model、怎么计费。
-amp-proxy-rs 处理这中间所有脏活：
+## 亮点
 
-- **按 model 路由** —— 请求 body 的 `model` 字段决定上游
-- **配置热重载** —— 改 `config.yaml` 不用重启
-- **协议翻译** —— Amp CLI 的 sub-agent 同时用 Anthropic Messages、OpenAI Responses、
-  Gemini generateContent 三种协议，你的网关只要会其中一种就行
-- **ampcode.com 兜底** —— 未映射的 model 仍可用，只是会消耗 Amp credits（日志会显式标 BILLABLE）
+- 🪶 **单文件 3.7 MB** —— LTO + strip + opt-z，零运行时依赖
+- 🔀 **五个协议翻译器** —— Anthropic Messages / OpenAI Responses ↔ chat-completions / Gemini `:generateContent` / **Gemini `:streamGenerateContent`**（上游 Go 版没有）
+- 🚿 **混合流式** —— peek 请求体前 16 KiB 做路由决策，剩余字节直接 stream 到上游，不占用内存
+- 🔁 **配置热重载** —— `mtime` 轮询，改 `config.yaml` 不用重启
+- 💸 **`BILLABLE` 警告** —— ampcode.com 兜底每次都打日志，credit 漏出秒级可见
+- 🧪 **142 个单元测试 + 端到端验证** —— 真实 Amp CLI 会话验证过 main agent / librarian / finder / DeepSeek 多轮 tool use
 
-## 工作原理
+---
 
-```
-Amp CLI
-  │
-  │  POST /api/provider/<name>/v1/...   /  /v1beta/models/...:generateContent
-  ▼
-amp-proxy-rs
-  │
-  ├── healthz / 鉴权 (api-keys)
-  │
-  ├── 路由决策 (FallbackHandler::decide)
-  │     1. 提取 model（body 优先，URL fallback）
-  │     2. 应用 model-mappings
-  │     3. 在 custom-providers Registry 里找 provider
-  │     4. 命中 → 转发；未命中 → ampcode.com 兜底
-  │
-  ├── Custom provider 转发
-  │     - Anthropic /v1/messages: stream 升级 + SSE 折叠回 JSON
-  │     - OpenAI /v1/responses: 可选翻译成 chat/completions
-  │     - Gemini :generateContent / :streamGenerateContent: 翻译成 OpenAI Responses
-  │
-  └── ampcode.com 兜底（标 BILLABLE）
-```
-
-## 功能矩阵
-
-| 能力 | 实现位置 |
-|---|---|
-| YAML 配置加载 + Validate | `src/config.rs` |
-| API key 鉴权（`x-api-key` 或 `Authorization: Bearer`） | `src/auth.rs` |
-| 配置热重载（mtime 轮询） | `src/main.rs::watch_config` |
-| `amp-proxy init` 交互向导 | `src/init.rs` |
-| Custom provider 注册表（按 model 路由） | `src/customproxy/mod.rs` |
-| 路径剥离（`/api/provider/<name>/v1...` → upstream leaf） | `src/customproxy/extract_leaf.rs` |
-| 重试 transport（瞬态错误一次重试） | `src/customproxy/retry_transport.rs` |
-| 模型映射（exact + 顺序 regex） | `src/amp/model_mapping.rs` |
-| Thinking suffix 解析（`(high)` / `(16384)` 等） | `src/thinking.rs` |
-| Anthropic `/v1/messages` 流式升级 | `src/customproxy/sse_messages_collapser.rs` |
-| OpenAI Responses SSE rewriter（`response.completed` patch） | `src/customproxy/sse_rewriter.rs` |
-| Gemini `:generateContent` ↔ OpenAI Responses 翻译 | `src/customproxy/gemini_translator.rs` |
-| Gemini `:streamGenerateContent` ↔ Responses SSE 流式翻译 | `src/customproxy/gemini_stream_translator.rs` |
-| OpenAI Responses ↔ chat/completions 翻译（请求 + 响应） | `src/customproxy/responses_translator.rs` |
-| Responses SSE 流式 translator（chat-only 上游） | `src/customproxy/responses_stream_translator.rs` |
-| ampcode.com 兜底反代（带 BILLABLE 警告） | `src/proxy.rs` |
-| Custom provider 转发（request_overrides 合并、SSE 折叠等） | `src/amp/proxy.rs` |
-| Gemini bridge（translate 模式 stream + non-stream 分发） | `src/amp/gemini_bridge.rs` |
-| 路由决策（5 类 RouteType） | `src/amp/fallback_handlers.rs` |
-| AMP-CLI / Vertex AI publishers/google/models 路由模式 | `src/amp/routes.rs` |
-| 结构化访问日志（`amp router: request/response` 配对） | `src/amp/routes.rs` |
-
-## 端到端验证
-
-通过真实 Amp CLI 会话验证四条主要数据路径：
-
-| 路径 | 验证情形 |
-|---|---|
-| `claude-sonnet-4-6` 主 agent + librarian → augment 风格上游 | 9 次调用全 200，零 WARN |
-| `gemini-3-flash-preview` finder → augment 上游 via translate | 17 次调用全 200，零 BILLABLE 模型流量 |
-| `gpt-5.4` → DeepSeek 经 Responses↔chat/completions 翻译 | 多轮 reasoning + tool_use 全 200 |
-| `/api/internal`、`/api/telemetry` 控制面 → ampcode.com | 正确兜底（这些本来就该走 ampcode） |
-
-## 构建 & 运行
+## 快速开始
 
 ```bash
-# 调试构建
-cargo run -- --config config.yaml
+git clone https://github.com/margbug01/amp-proxy-rs.git
+cd amp-proxy-rs
 
-# 发布构建（3.6 MB）
+# 1. 构建（约 1 分钟）
 cargo build --release
-ls -lh target/release/amp-proxy.exe   # Windows
-ls -lh target/release/amp-proxy       # Linux / macOS
 
-# 交互式生成 config.yaml
+# 2. 交互式生成 config.yaml
 ./target/release/amp-proxy init
+
+# 3. 启动
+./target/release/amp-proxy --config config.yaml
 ```
-
-最简配置 `config.yaml`：
-
-```yaml
-host: "127.0.0.1"
-port: 8317
-api-keys:
-  - "change-me"
-ampcode:
-  upstream-url: "https://ampcode.com"
-  upstream-api-key: ""           # Amp session token，可空
-  custom-providers:
-    - name: "my-gateway"
-      url: "http://host:port/v1"
-      api-key: "your-bearer-token"
-      models:
-        - "gpt-5.4"
-        - "gpt-5.4-mini"
-      responses-translate: true  # chat/completions-only 网关才需要
-  model-mappings:
-    - from: "claude-opus-4-6"
-      to: "gpt-5.4(high)"
-  force-model-mappings: true
-  gemini-route-mode: "translate"
-```
-
-完整字段见 [`config.example.yaml`](config.example.yaml)。
 
 把 Amp CLI 指过来：
 
@@ -131,99 +50,210 @@ export AMP_API_KEY=<config.yaml 里的 api-keys 之一>
 amp
 ```
 
-冒烟测试：
+> Windows 下用 [`scripts/restart.ps1`](scripts/restart.ps1) 一键启停 + 日志重定向。
 
-```bash
-./target/release/amp-proxy --config config.yaml &
-curl http://127.0.0.1:8317/healthz                                       # 200
-curl -i http://127.0.0.1:8317/v1/messages -X POST -d '{}'                # 401（无 api key）
-curl -i -H "x-api-key: <你的 key>" http://127.0.0.1:8317/v1/messages -X POST \
-  -H "Content-Type: application/json" \
-  -d '{"model":"claude-opus-4-6","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}'
+---
+
+## 工作原理
+
 ```
+                          ┌──────────────────────────┐
+                          │       Amp CLI            │
+                          └────────────┬─────────────┘
+                                       │  HTTPS
+                                       ▼
+                          ┌──────────────────────────┐
+                          │    amp-proxy-rs          │
+                          │  ──────────────────      │
+                          │  1. healthz / 鉴权        │
+                          │  2. peek 16 KiB          │
+                          │  3. FallbackHandler      │
+                          │     ┌────────┐           │
+                          │     │ model? │           │
+                          │     └────┬───┘           │
+                          └──────────┼───────────────┘
+                                     │
+              ┌──────────────────────┼─────────────────────┐
+              │                      │                     │
+              ▼                      ▼                     ▼
+    ┌─────────────────┐   ┌──────────────────┐   ┌──────────────────┐
+    │ custom-provider │   │ Gemini bridge    │   │ ampcode.com      │
+    │ (你的网关)       │   │ (translate)      │   │ (兜底·BILLABLE)   │
+    └─────────────────┘   └──────────────────┘   └──────────────────┘
+       │  /messages           /generateContent       /api/internal
+       │  /responses          /streamGenerateContent  /api/telemetry
+       │  /chat/completions
+       │
+       └─ Anthropic SSE 升级 + 折叠
+       └─ Responses ↔ chat/completions 翻译
+```
+
+---
+
+## 配置示例
+
+最小配置（`config.yaml`）：
+
+```yaml
+host: "127.0.0.1"
+port: 8317
+
+api-keys:
+  - "change-me"
+
+ampcode:
+  upstream-url: "https://ampcode.com"
+  upstream-api-key: ""           # Amp session token，可空
+
+  custom-providers:
+    - name: "my-gateway"
+      url: "http://host:port/v1"
+      api-key: "your-bearer-token"
+      models:
+        - "gpt-5.4"
+        - "gpt-5.4-mini"
+      responses-translate: true  # chat/completions-only 网关才需要
+
+  model-mappings:
+    - from: "claude-opus-4-6"
+      to: "gpt-5.4(high)"
+
+  force-model-mappings: true
+  gemini-route-mode: "translate"
+```
+
+完整字段说明见 [`config.example.yaml`](config.example.yaml)。
+
+---
+
+## 路由决策
+
+| 步骤 | 判断 | 动作 |
+|---|---|---|
+| 1 | 从 body 或 URL path 提取 `model` | — |
+| 2 | `force-model-mappings` + `model-mappings` 命中 | 就地改写 `model` |
+| 3 | 改写后的 model 出现在某 `custom-providers[*].models` | 转发到对应网关，注入 Bearer token |
+| 4 | Google v1beta 路径 + `gemini-route-mode: translate` | 先跑 Gemini ↔ Responses 翻译再转发 |
+| 5 | 以上都不命中 | 兜底走 `ampcode.com`（**消耗 Amp credits**） |
+
+---
+
+## 五个协议翻译器
+
+| 翻译器 | 用途 | 文件 |
+|---|---|---|
+| **Anthropic Messages 流式升级** | 修上游非流式 `/messages` 内容丢失 bug | `src/customproxy/sse_messages_collapser.rs` |
+| **Gemini ↔ OpenAI Responses (非流式)** | `finder` sub-agent 的 `:generateContent` | `src/customproxy/gemini_translator.rs` |
+| **Gemini ↔ OpenAI Responses (流式)** | `:streamGenerateContent` —— 上游 Go 版没有 | `src/customproxy/gemini_stream_translator.rs` |
+| **Responses ↔ chat/completions (请求 + 响应)** | DeepSeek 等 chat-only 上游 | `src/customproxy/responses_translator.rs` |
+| **Responses SSE 流式** | 同上的流式响应路径 | `src/customproxy/responses_stream_translator.rs` |
+
+---
 
 ## 怎么读 `run.log`
 
-默认 INFO 日志，每个请求两行：**入口**（路由决策）+ **出口**（状态码 + 时延）。
-日常运维和回归排查只看以下几个 prefix 就够：
+每个 Amp CLI 请求两行：**入口**（路由决策）+ **出口**（状态码 + 时延）。
 
-| 日志前缀 | 出现位置 | 含义 |
-|---|---|---|
-| `amp router: request` | 任何 Amp CLI 模型请求 | 决策已生成；带 `route=...` `requested_model=...` `resolved_model=...` `provider=...` `gemini_translate=...` |
-| `amp router: response` | 同上配对 | 终态；带 `status=...` `elapsed_ms=...` |
-| `customproxy: forwarding` | 命中 custom provider 时 | 实际外发；带 `upgraded_messages=...` `translate_responses=...` |
-| `gemini-translate: forwarding` | Gemini 翻译器走流式 / 非流式分支前 | 带 `stream=...` `in_bytes=...` `translated_bytes=...` `url=...` |
-| `ampcode fallback: forwarding (BILLABLE — uses Amp credits)` | 落到 ampcode.com 兜底 | 控制面流量正常出现这条；**模型流量出现这条就是路由 miss / 翻译器拒收，需要排查** |
-| `WARN gemini-translate: response translation failed` | translator 解析失败 | 上游回了非预期 shape；客户端会拿到原始字节 |
+| 日志前缀 | 含义 |
+|---|---|
+| `amp router: request` | 决策已生成；含 `route` `requested_model` `resolved_model` `provider` `gemini_translate` `streaming` 字段 |
+| `amp router: response` | 终态；含 `status` `elapsed_ms` |
+| `customproxy: forwarding` | 实际外发 custom provider |
+| `gemini-translate: forwarding` | Gemini 翻译器分流式 / 非流式分支 |
+| `ampcode fallback: forwarding (BILLABLE — uses Amp credits)` | **见到这条说明 credit 在被扣**，控制面流量正常出现，模型流量出现就要排查 |
 
 排查节奏：
 
 ```bash
-# 看是否有模型流量泄露到 ampcode.com（控制面那几条排除掉）
+# 模型流量是否泄露到 ampcode.com（控制面流量排除掉）
 grep BILLABLE run.log | grep -v "/api/internal\|/api/telemetry\|/news.rss"
 
-# 看翻译器是否有失败
+# 翻译器是否失败
 grep WARN run.log
 
-# 看某次请求的完整链路（拼路径关键字）
+# 单次请求完整链路
 grep "publishers/google/models/gemini-3-flash-preview" run.log
 ```
 
-要更详细，临时开 debug：
+更详细的日志：`RUST_LOG=amp_proxy=debug,tower_http=info`。
 
-```bash
-RUST_LOG=amp_proxy=debug,tower_http=info ./target/release/amp-proxy --config config.yaml
+---
+
+## 调试 middleware（按需启用）
+
+两个零成本默认关闭的 middleware，加配置就开：
+
+```yaml
+debug:
+  # 给每个请求加 "request log" INFO 行，含 model/stream peek
+  access-log-model-peek: true
+
+  # 把指定路径的请求/响应 body 落盘
+  capture-path-substring: "/v1/responses"
+  capture-dir: "./capture"
 ```
+
+---
+
+## 性能
+
+`cargo bench --bench translators` 跑过 simd-json vs serde_json 的实测对比，
+发现 **drop-in 兼容路径下 simd-json 反而慢 17%**，结论是不采用。
+完整数据见 [`BENCHMARKS.md`](BENCHMARKS.md)。
+
+---
+
+## 端到端验证
+
+通过真实 Amp CLI 会话验证四条主要数据路径：
+
+| 路径 | 验证情形 |
+|---|---|
+| `claude-sonnet-4-6` 主 agent + librarian → augment-style 上游 | 9 次调用全 200，零 WARN |
+| `gemini-3-flash-preview` finder → 上游 via translate | 17 次调用全 200，零 BILLABLE 模型流量 |
+| `gpt-5.4` → DeepSeek 经 Responses↔chat/completions | 多轮 reasoning + tool_use 全 200 |
+| `/api/internal`、`/api/telemetry` 控制面 → ampcode.com | 正确兜底（这些本来就该走 ampcode） |
+
+---
 
 ## 测试
 
 ```bash
 cargo test
-# test result: ok. 130 passed; 0 failed
+# test result: ok. 142 passed; 0 failed
 ```
 
-重点模块测试数量：
-- `customproxy::tests` — Registry + lookup（5 个）
-- `customproxy::sse_*` — collapser/rewriter 流式正确性（10+ 个）
-- `customproxy::gemini_translator` — 请求/响应双向（5 个）
-- `customproxy::gemini_stream_translator` — SSE 状态机（3 个）
-- `customproxy::responses_translator` — 字段映射、tool 翻译（7 个）
-- `customproxy::responses_stream_translator` — Responses SSE 翻译（3 个）
-- `amp::fallback_handlers` — 五种 RouteType 决策 + Vertex path 提取（10 个）
-- `auth` — ArcSwap 并发读 / 原子换值（3 个，含 4 reader + 1 writer 压测）
-- `proxy` — ampcode 兜底流式上行 + 64 MiB cap（2 个）
-- `access_log` / `body_capture` — middleware 行为（7 个）
-- `init` — 配置生成 + 解析往返（3 个）
+完整模块测试覆盖：
 
-## 调试 middleware（可选，按需启用）
+| 模块 | 测试数 |
+|---|---|
+| `customproxy` (Registry / SSE / 5 个 translator) | 38+ |
+| `amp::fallback_handlers` (5 路决策 + Vertex path) | 10 |
+| `amp::routes` (peek + can_stream 决策 + dispatch) | 9 |
+| `amp::prefixed_body` (混合流式适配器) | 3 |
+| `auth` (ArcSwap 并发读 / 原子换值) | 3 |
+| `proxy` (兜底流式 + 64 MiB cap) | 2 |
+| `access_log` / `body_capture` (debug middleware) | 7 |
+| `init` (配置生成 + 解析往返) | 3 |
 
-两个零成本默认关闭的 middleware，按 `debug.*` 配置开启：
+---
 
-```yaml
-debug:
-  # 在 INFO 日志里给每个请求加 "request log" 行，含 model/stream peek
-  access-log-model-peek: true
+## 路线图
 
-  # 把指定路径的请求/响应 body 落盘到 ./capture/<timestamp>-<method>-<path>.log
-  capture-path-substring: "/v1/responses"
-  capture-dir: "./capture"
-```
+完成的项见 [CHANGELOG.md](CHANGELOG.md)。剩余开放项：
 
-`access-log-model-peek` 只在 JSON POST/PUT 请求且 body ≤ 256 KiB 时才 peek；
-`body_capture` 在每个方向上限 2 MiB（超出会写截断标记），落盘失败仅 `warn`，不会破坏请求。
+- **Prometheus `/metrics` 端点** —— request count / latency histogram / billable counter，给 Grafana 看
+- **Provider health checks + 自动 failover** —— 上游连续超时时临时切换，恢复后切回
+- **Body capture pretty-print 工具** —— 抓的 .log 文件格式化成可读 JSON
 
-## 路线图 / Good first issues
+---
 
-1. **`amp::routes::handle` 也做流式** —— 当前 `src/proxy.rs::forward`
-   （ampcode 兜底）已经流式上行，但 `src/amp/routes.rs::handle` 因为要 peek body
-   做模型决策，还是 buffer 16 MiB。可以拆成"buffer 头几 KB 看 model，然后剩下的流式拼接转发"
-   的混合策略——是个学 `http_body::Body` 自定义实现的硬题目。
-2. **零拷贝 JSON 路径访问** —— 所有 translator 走 `serde_json::Value` 反序列化。
-   引入 `simd-json` 或自己写一个 path-based 访问器，比对 Go 版 `gjson` 在大 body
-   下的延迟差异。需要先建立 benchmark 基线。
-3. **`amp::proxy::forward_to_custom_provider` 流式上行** —— 同 #1，但路径已知不需要
-   peek body（用 `decision` 里已经决定好的 path leaf 转发即可），改造成本更低。
+## 鸣谢
+
+`amp-proxy-rs` 的协议翻译算法 + custom provider 路由决策模型源自
+[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)（MIT），
+原归属见 [NOTICE.md](NOTICE.md)。
 
 ## License
 
-MIT。归属与衍生关系详见 [NOTICE.md](NOTICE.md)。
+[MIT](LICENSE)

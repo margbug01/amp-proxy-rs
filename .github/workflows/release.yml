@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: amp-proxy-x86_64-linux.tar.gz
+            bin: amp-proxy
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive: amp-proxy-x86_64-macos.tar.gz
+            bin: amp-proxy
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: amp-proxy-x86_64-windows.zip
+            bin: amp-proxy.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-release-${{ matrix.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+
+      - run: cargo --version && rustc --version
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp target/release/${{ matrix.bin }} dist/
+          cp LICENSE NOTICE.md README.md CHANGELOG.md dist/
+          cp config.example.yaml dist/
+          tar -czf ${{ matrix.archive }} -C dist .
+          shasum -a 256 ${{ matrix.archive }} | tee ${{ matrix.archive }}.sha256
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/release/${{ matrix.bin }} dist/
+          Copy-Item LICENSE, NOTICE.md, README.md, CHANGELOG.md, config.example.yaml dist/
+          Compress-Archive -Path dist/* -DestinationPath ${{ matrix.archive }}
+          $hash = (Get-FileHash -Algorithm SHA256 ${{ matrix.archive }}).Hash.ToLower()
+          "$hash  ${{ matrix.archive }}" | Out-File -FilePath ${{ matrix.archive }}.sha256 -Encoding ASCII
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ matrix.archive }}
+            ${{ matrix.archive }}.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
