@@ -6,6 +6,17 @@ versioning follows [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-04-27
+
+### Fixed
+
+- Improved Gemini bridge `messages-translate` semantic parity for finder-style
+  tool use by preserving Responses `input_text` user messages and grouping
+  assistant text plus consecutive function calls into a single Anthropic
+  Messages assistant turn with multiple `tool_use` blocks.
+- Added Gemini `gemini-3.0-flash` routing coverage for translate-mode mappings
+  to DeepSeek Anthropic-compatible providers.
+
 ## [0.3.0] - 2026-04-27
 
 ### Added
