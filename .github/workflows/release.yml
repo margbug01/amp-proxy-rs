@@ -75,7 +75,12 @@ jobs:
           files: |
             ${{ matrix.archive }}
             ${{ matrix.archive }}.sha256
-          generate_release_notes: true
+          # generate_release_notes intentionally disabled here — when the
+          # matrix runs in parallel, three concurrent jobs would each
+          # regenerate-and-append notes, producing duplicates. The release
+          # body should be set once via `gh release edit` after all builds
+          # finish (or in a separate single-run job).
+          generate_release_notes: false
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
