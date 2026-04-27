@@ -24,7 +24,7 @@
 | 能力 | 说明 |
 |---|---|
 | 🪶 小体积 release 二进制 | LTO + strip + `opt-level = "z"`，无需额外运行时服务 |
-| 🔀 五个协议翻译器 | Anthropic Messages、OpenAI Responses、chat/completions、Gemini 非流式与流式 |
+| 🔀 双格式 Gemini bridge | Gemini 可转 OpenAI Responses、chat/completions 或 Anthropic Messages，覆盖非流式与流式 |
 | 🚿 混合流式转发 | 只 peek 前 16 KiB 做路由，后续 body 继续流式转发 |
 | 🔁 配置热重载 | API key、model mapping、provider 路由可热更新；监听地址变更仍需重启 |
 | 🩺 Provider failover | 同一个 model 可配置多个上游，主上游异常后自动切换，恢复后切回 |
@@ -77,6 +77,7 @@ flowchart TD
     C --> T1[Anthropic Messages SSE 升级/折叠]
     C --> T2[Responses ↔ chat/completions]
     G --> T3[generateContent / streamGenerateContent]
+    T3 --> T4[可继续转 chat/completions 或 Anthropic Messages]
 ```
 
 关键分工：
@@ -111,6 +112,13 @@ ampcode:
         - "gpt-5.4-mini"
       responses-translate: true
 
+    - name: "deepseek-anthropic"
+      url: "https://api.deepseek.com/anthropic"
+      api-key: "deepseek-token"
+      models:
+        - "deepseek-v4-flash"
+      messages-translate: true
+
     - name: "backup-gateway"
       url: "http://localhost:8001/v1"
       api-key: "backup-token"
@@ -137,7 +145,7 @@ ampcode:
 | 2 | `force-model-mappings` / `model-mappings` 命中 | 改写上游请求里的 `model` 字段 |
 | 3 | 解析后的 model 出现在 `custom-providers[*].models` | 转发到第一个健康 provider，并注入 Bearer token |
 | 4 | 多个 provider 服务同一个 model | 连续传输失败后切到后备；探活恢复后切回主上游 |
-| 5 | Google Gemini 路径且 `gemini-route-mode: translate` | 先做 Gemini ↔ OpenAI Responses 翻译再转发 |
+| 5 | Google Gemini 路径且 `gemini-route-mode: translate` | 先做 Gemini ↔ OpenAI Responses；若 provider 配了 `responses-translate` 或 `messages-translate`，再转 chat/completions 或 Anthropic Messages |
 | 6 | 以上都不命中 | 兜底到 ampcode.com，计为 **billable** |
 
 ---
@@ -167,7 +175,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 当前本地结果：
 
 ```text
-test result: ok. 159 passed; 0 failed
+test result: ok. 167 passed; 0 failed
 ```
 
 ---

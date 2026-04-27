@@ -550,6 +550,7 @@ mod tests {
             models: models.iter().map(|s| s.to_string()).collect(),
             request_overrides: Map::new(),
             responses_translate: false,
+            messages_translate: false,
         }
     }
 
@@ -691,6 +692,7 @@ mod tests {
             models: vec!["m".into()],
             request_overrides: Map::new(),
             responses_translate: false,
+            messages_translate: false,
         };
         let d = RouteDecision {
             route_type: AmpRouteType::CustomProvider,
@@ -719,6 +721,7 @@ mod tests {
             models: vec!["m".into()],
             request_overrides: Map::new(),
             responses_translate: false,
+            messages_translate: false,
         };
         let d = RouteDecision {
             route_type: AmpRouteType::ModelMapping,
@@ -746,6 +749,7 @@ mod tests {
             models: vec!["m".into()],
             request_overrides: Map::new(),
             responses_translate: true,
+            messages_translate: false,
         };
         let d = RouteDecision {
             route_type: AmpRouteType::CustomProvider,

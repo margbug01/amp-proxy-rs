@@ -16,6 +16,7 @@ pub mod sse_rewriter;
 // Stubs for Phase 2A — declared so cargo check passes; agents will fill them.
 pub mod gemini_stream_translator;
 pub mod gemini_translator;
+pub mod messages_translator;
 pub mod responses_stream_translator;
 pub mod responses_translator;
 
@@ -44,6 +45,9 @@ pub struct Provider {
     /// When true, OpenAI Responses requests are translated to/from
     /// chat/completions for this provider.
     pub responses_translate: bool,
+    /// When true, requests on the Gemini bridge path are translated to
+    /// Anthropic Messages format (`/v1/messages`) instead of OpenAI Responses.
+    pub messages_translate: bool,
 }
 
 /// Inner snapshot held inside the [`Registry`]'s [`ArcSwap`]. Reads see a
@@ -132,6 +136,7 @@ impl Registry {
                 models: c.models.clone(),
                 request_overrides: c.request_overrides.clone(),
                 responses_translate: c.responses_translate,
+                messages_translate: c.messages_translate,
             });
             providers.push(provider.clone());
 
@@ -319,6 +324,7 @@ mod tests {
             models: models.iter().map(|s| s.to_string()).collect(),
             request_overrides: Map::new(),
             responses_translate: false,
+            messages_translate: false,
         }
     }
 
@@ -403,6 +409,7 @@ mod tests {
                 models: vec!["m".into()],
                 request_overrides: Map::new(),
                 responses_translate: false,
+                messages_translate: false,
             }])
             .unwrap_err();
         assert!(err.contains("invalid"));
@@ -416,6 +423,7 @@ mod tests {
                 models: vec![],
                 request_overrides: Map::new(),
                 responses_translate: false,
+                messages_translate: false,
             }])
             .unwrap_err();
         assert!(err.contains("invalid"));

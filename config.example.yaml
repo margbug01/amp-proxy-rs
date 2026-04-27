@@ -61,8 +61,8 @@ ampcode:
   force-model-mappings: true
 
   # Custom upstream providers — route specific models to a third-party
-  # OpenAI-compatible endpoint instead of ampcode.com. Request body's
-  # model field is matched against each provider's "models" list.
+  # OpenAI-compatible or Anthropic-compatible endpoint instead of ampcode.com.
+  # Request body's model field is matched against each provider's "models" list.
   # Multiple providers may list the same model; amp-proxy uses the first
   # healthy provider and fails over after consecutive transport failures.
   custom-providers: []
@@ -72,8 +72,10 @@ ampcode:
     #   models:
     #     - "gpt-5.4"
     #     - "gpt-5.4-mini"
-    #   # For chat/completions-only upstreams such as api.deepseek.com:
+    #   # For chat/completions-only upstreams such as https://api.deepseek.com:
     #   # responses-translate: true
+    #   # For Anthropic Messages upstreams such as https://api.deepseek.com/anthropic:
+    #   # messages-translate: true
     #   # Optional fixed fields shallow-merged into Anthropic /messages bodies:
     #   # request-overrides:
     #   #   reasoning_effort: "high"
@@ -82,7 +84,9 @@ ampcode:
   # (used by Amp CLI's finder subagent) when they hit a custom provider:
   #   "ampcode"   (default) fall through to ampcode.com, consumes credits
   #   "translate" amp-proxy rewrites Gemini -> OpenAI Responses and forwards
-  #               to the matched custom provider, saving credits
+  #               to the matched custom provider. If the provider sets
+  #               responses-translate, it continues to chat/completions; if it
+  #               sets messages-translate, it continues to Anthropic Messages.
   gemini-route-mode: "ampcode"
 
 # Debug-only settings. Leave disabled in production — captured/logged bodies

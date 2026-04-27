@@ -78,6 +78,8 @@ pub struct CustomProvider {
     pub request_overrides: serde_json::Map<String, serde_json::Value>,
     #[serde(default)]
     pub responses_translate: bool,
+    #[serde(default)]
+    pub messages_translate: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

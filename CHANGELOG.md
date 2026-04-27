@@ -6,6 +6,28 @@ versioning follows [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-04-27
+
+### Added
+
+- Gemini bridge now supports dual downstream formats: `responses-translate`
+  continues Gemini → OpenAI Responses into chat/completions, while the new
+  `messages-translate` provider flag continues Gemini → OpenAI Responses into
+  Anthropic Messages.
+
+### Fixed
+
+- Gemini bridge disables DeepSeek-style thinking on both chat/completions and
+  Anthropic Messages translation paths, preventing multi-turn failures caused
+  by non-round-trippable reasoning content.
+
+### Notes
+
+- Documented DeepSeek Gemini bridge validation status in
+  `GEMINI_BRIDGE_DEEPSEEK_TEST_NOTES.md`. OpenAI `responses-translate` is the
+  recommended path; Anthropic `messages-translate` is protocol-valid but remains
+  experimental for finder-style multi-turn tool use.
+
 ## [0.2.0] - 2026-04-27
 
 Adds the three operational features that were on the roadmap after v0.1.0:

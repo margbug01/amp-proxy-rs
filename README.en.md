@@ -24,7 +24,7 @@ Route selected models to your own OpenAI-compatible providers, keep Amp control-
 | Capability | What you get |
 |---|---|
 | 🪶 Small release binary | LTO + strip + `opt-level = "z"`; no external runtime service required |
-| 🔀 Five protocol translators | Anthropic Messages, OpenAI Responses, chat/completions, Gemini `generateContent`, and Gemini streaming |
+| 🔀 Dual-format Gemini bridge | Gemini can translate to OpenAI Responses, chat/completions, or Anthropic Messages across non-streaming and streaming paths |
 | 🚿 Hybrid streaming | Peeks the first 16 KiB for routing, then streams the rest without buffering the whole request |
 | 🔁 Hot reload | API keys, model mappings, and provider routing update from `config.yaml`; host/port still require restart |
 | 🩺 Provider failover | Multiple providers can serve the same model; unhealthy primaries fail over and recover automatically |
@@ -77,6 +77,7 @@ flowchart TD
     C --> T1[Anthropic Messages SSE upgrade/collapse]
     C --> T2[Responses ↔ chat/completions]
     G --> T3[generateContent / streamGenerateContent]
+    T3 --> T4[Optional chat/completions or Anthropic Messages]
 ```
 
 Important split:
@@ -111,6 +112,13 @@ ampcode:
         - "gpt-5.4-mini"
       responses-translate: true
 
+    - name: "deepseek-anthropic"
+      url: "https://api.deepseek.com/anthropic"
+      api-key: "deepseek-token"
+      models:
+        - "deepseek-v4-flash"
+      messages-translate: true
+
     - name: "backup-gateway"
       url: "http://localhost:8001/v1"
       api-key: "backup-token"
@@ -137,7 +145,7 @@ See the fully commented [config.example.yaml](config.example.yaml) for every fie
 | 2 | `force-model-mappings` / `model-mappings` match | Rewrite the upstream `model` field |
 | 3 | The resolved model appears in `custom-providers[*].models` | Send to the first healthy provider and inject its Bearer token |
 | 4 | Multiple providers serve the same model | Fail over after consecutive transport failures; switch back after health recovery |
-| 5 | Google Gemini path with `gemini-route-mode: translate` | Translate Gemini ↔ OpenAI Responses before forwarding |
+| 5 | Google Gemini path with `gemini-route-mode: translate` | Translate Gemini ↔ OpenAI Responses; if the provider sets `responses-translate` or `messages-translate`, continue to chat/completions or Anthropic Messages |
 | 6 | Nothing matches | Fall back to ampcode.com and count as **billable** |
 
 ---
@@ -167,7 +175,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 Current local result:
 
 ```text
-test result: ok. 159 passed; 0 failed
+test result: ok. 167 passed; 0 failed
 ```
 
 ---

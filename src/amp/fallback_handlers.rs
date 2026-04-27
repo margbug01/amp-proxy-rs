@@ -308,6 +308,7 @@ mod tests {
             models: models.iter().map(|s| s.to_string()).collect(),
             request_overrides: Map::new(),
             responses_translate: false,
+            messages_translate: false,
         }
     }
 

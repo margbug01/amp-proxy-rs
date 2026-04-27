@@ -1,6 +1,6 @@
 [package]
 name = "amp-proxy"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 description = "Rust port of amp-proxy — focused reverse proxy for Sourcegraph Amp CLI"
 license = "MIT"
