@@ -1,0 +1,92 @@
+# amp-proxy configuration example
+
+# HTTP server bind address
+host: "127.0.0.1"
+port: 8787
+
+# API keys that local clients must present to the proxy
+# (this is the LOCAL proxy auth, NOT the Amp upstream API key)
+api-keys:
+  - "change-me-local-key"
+
+# Sourcegraph Amp upstream configuration
+ampcode:
+  # Base URL of the Amp control plane
+  upstream-url: "https://ampcode.com"
+
+  # Default API key forwarded to ampcode.com (or empty to use per-client keys)
+  upstream-api-key: ""
+
+  # Per-client upstream API key routing (optional)
+  # Incoming clients can be mapped to different upstream keys
+  upstream-api-keys: []
+
+  # Restrict /api/internal, /api/user, /api/auth, /threads, /docs, /settings
+  # and root-level auth routes to localhost connections only
+  restrict-management-to-localhost: true
+
+  # Model mappings — rewrite the "model" field in requests before forwarding.
+  #
+  # The block below covers every model Amp CLI's main agent and subagents
+  # normally request (claude opus/sonnet/haiku, gpt-5.4 family, gemini
+  # 2.5-flash-lite, gemini-3-flash-preview) and redirects them all to a
+  # gpt-5.4 / gpt-5.4-mini backend configured under `custom-providers`.
+  # If your gateway exposes different model names, change the "to:"
+  # values; the "from:" side must stay as shown so Amp CLI's own model
+  # strings keep matching.
+  model-mappings:
+    - from: "claude-opus-4-6"
+      to: "gpt-5.4(high)"
+    - from: "claude-sonnet-4-6-thinking"
+      to: "gpt-5.4-mini(high)"
+    - from: "claude-haiku-4-5-20251001"
+      to: "gpt-5.4-mini"
+    - from: "gpt-5.4"
+      to: "gpt-5.4(xhigh)"
+    - from: "gemini-2.5-flash-lite-preview-09-2025"
+      to: "gpt-5.4-mini"
+    - from: "gemini-2.5-flash-lite"
+      to: "gpt-5.4-mini"
+    - from: "claude-sonnet-4-6"
+      to: "gpt-5.4-mini(high)"
+    - from: "gpt-5.3-codex"
+      to: "gpt-5.4(high)"
+    - from: "gemini-3-flash-preview"
+      to: "gpt-5.4-mini(high)"
+
+  # Route mapped models ahead of local providers. True is the right
+  # default when you are using the model-mappings block above; flip to
+  # false only if you want the original model to win whenever a local
+  # OAuth provider claims it.
+  force-model-mappings: true
+
+  # Custom upstream providers — route specific models to a third-party
+  # OpenAI-compatible endpoint instead of ampcode.com. Request body's
+  # model field is matched against each provider's "models" list.
+  custom-providers: []
+    # - name: "my-openai-compat"
+    #   url: "http://host:port/v1"
+    #   api-key: "your-bearer-token"
+    #   models:
+    #     - "gpt-5.4"
+    #     - "gpt-5.4-mini"
+    #   # For chat/completions-only upstreams such as api.deepseek.com:
+    #   # responses-translate: true
+    #   # Optional fixed fields shallow-merged into Anthropic /messages bodies:
+    #   # request-overrides:
+    #   #   reasoning_effort: "high"
+
+  # How to route Google Gemini v1beta / v1beta1 generateContent requests
+  # (used by Amp CLI's finder subagent) when they hit a custom provider:
+  #   "ampcode"   (default) fall through to ampcode.com, consumes credits
+  #   "translate" amp-proxy rewrites Gemini -> OpenAI Responses and forwards
+  #               to the matched custom provider, saving credits
+  gemini-route-mode: "ampcode"
+
+# Debug-only settings. Leave disabled in production — captured/logged bodies
+# may include prompts, tool calls, and other sensitive context.
+#
+# debug:
+#   access-log-model-peek: false
+#   capture-path-substring: "/v1/responses"
+#   capture-dir: "./capture"

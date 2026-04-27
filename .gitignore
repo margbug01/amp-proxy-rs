@@ -1,0 +1,9 @@
+/target
+/config.yaml
+/config.local.yaml
+*.log
+*.log.*
+*.log.err
+/capture
+/capture_outbound
+.DS_Store
