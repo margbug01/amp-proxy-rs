@@ -2,12 +2,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
     middleware,
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
+use serde::Serialize;
 use serde_json::json;
 use tower_http::trace::TraceLayer;
 use tracing::info;
@@ -18,6 +19,7 @@ use crate::amp::AmpModule;
 use crate::auth::{auth_middleware, ApiKeyValidator};
 use crate::body_capture::{body_capture_layer, CaptureConfig};
 use crate::config::Config;
+use crate::customproxy;
 use crate::error::{AppError, Result};
 use crate::metrics::{metrics_middleware, Metrics, PROMETHEUS_CONTENT_TYPE};
 use crate::proxy::{forward, AmpcodeProxy};
@@ -29,6 +31,25 @@ pub struct AppState {
     pub ampcode: Option<AmpcodeProxy>,
     pub amp_module: Arc<AmpModule>,
     pub metrics: Arc<Metrics>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StatusResponse {
+    status: &'static str,
+    models: Vec<String>,
+    providers: Vec<ProviderStatus>,
+    metrics: crate::metrics::MetricsSnapshot,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderStatus {
+    name: String,
+    url: String,
+    healthy: bool,
+    consecutive_failures: u32,
+    last_error: Option<String>,
 }
 
 pub fn build_app(cfg: &Config) -> Result<(Router, SharedState)> {
@@ -62,6 +83,12 @@ pub fn build_app(cfg: &Config) -> Result<(Router, SharedState)> {
     let core: Router<()> = Router::new()
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics_handler))
+        .route("/admin/status", get(status_handler))
+        .route("/admin/providers", get(providers_handler))
+        .route(
+            "/admin/providers/:name/recover",
+            post(provider_recover_handler),
+        )
         .fallback(forward)
         .with_state(state.clone());
 
@@ -113,7 +140,11 @@ pub fn build_app(cfg: &Config) -> Result<(Router, SharedState)> {
 }
 
 async fn healthz() -> Json<serde_json::Value> {
-    Json(json!({"status": "ok"}))
+    Json(json!({
+        "status": "ok",
+        "service": "amp-proxy",
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
 }
 
 async fn metrics_handler(State(state): State<SharedState>) -> Response {
@@ -122,6 +153,38 @@ async fn metrics_handler(State(state): State<SharedState>) -> Response {
         state.metrics.render_prometheus(),
     )
         .into_response()
+}
+
+async fn status_handler(State(state): State<SharedState>) -> Json<StatusResponse> {
+    Json(StatusResponse {
+        status: "ok",
+        models: customproxy::global().model_ids(),
+        providers: provider_statuses(),
+        metrics: state.metrics.snapshot(),
+    })
+}
+
+async fn providers_handler() -> Json<Vec<ProviderStatus>> {
+    Json(provider_statuses())
+}
+
+async fn provider_recover_handler(Path(name): Path<String>) -> Json<serde_json::Value> {
+    customproxy::global().record_success(&name);
+    Json(json!({"status": "ok", "provider": name}))
+}
+
+fn provider_statuses() -> Vec<ProviderStatus> {
+    customproxy::global()
+        .health_snapshots()
+        .into_iter()
+        .map(|p| ProviderStatus {
+            name: p.name,
+            url: p.url,
+            healthy: p.healthy,
+            consecutive_failures: p.consecutive_failures,
+            last_error: p.last_error,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -176,5 +239,31 @@ mod tests {
         let body = std::str::from_utf8(&body).unwrap();
         assert!(body.contains("requests_total 1"));
         assert!(body.contains("request_duration_seconds_count 1"));
+    }
+
+    #[tokio::test]
+    async fn admin_status_requires_auth_and_returns_json() {
+        let (app, _state) = build_app(&test_config()).expect("build app");
+
+        let unauth_req = HttpRequest::builder()
+            .uri("/admin/status")
+            .body(Body::empty())
+            .unwrap();
+        let unauth_resp = app.clone().oneshot(unauth_req).await.unwrap();
+        assert_eq!(unauth_resp.status(), StatusCode::UNAUTHORIZED);
+
+        let auth_req = HttpRequest::builder()
+            .uri("/admin/status")
+            .header("x-api-key", "secret")
+            .body(Body::empty())
+            .unwrap();
+        let auth_resp = app.oneshot(auth_req).await.unwrap();
+        assert_eq!(auth_resp.status(), StatusCode::OK);
+        let body = to_bytes(auth_resp.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["status"], "ok");
+        assert!(body["providers"].is_array());
+        assert!(body["models"].is_array());
+        assert_eq!(body["metrics"]["requestsTotal"], 1);
     }
 }

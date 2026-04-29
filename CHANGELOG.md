@@ -32,13 +32,6 @@ versioning follows [SemVer](https://semver.org/spec/v2.0.0.html).
   Anthropic Messages translation paths, preventing multi-turn failures caused
   by non-round-trippable reasoning content.
 
-### Notes
-
-- Documented DeepSeek Gemini bridge validation status in
-  `GEMINI_BRIDGE_DEEPSEEK_TEST_NOTES.md`. OpenAI `responses-translate` is the
-  recommended path; Anthropic `messages-translate` is protocol-valid but remains
-  experimental for finder-style multi-turn tool use.
-
 ## [0.2.0] - 2026-04-27
 
 Adds the three operational features that were on the roadmap after v0.1.0:

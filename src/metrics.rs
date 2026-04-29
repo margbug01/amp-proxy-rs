@@ -6,8 +6,18 @@ use std::time::{Duration, Instant};
 use axum::extract::{Request, State};
 use axum::middleware::Next;
 use axum::response::Response;
+use serde::Serialize;
 
 pub const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricsSnapshot {
+    pub requests_total: u64,
+    pub request_duration_count: u64,
+    pub request_duration_sum_seconds: f64,
+    pub billable_requests_total: u64,
+}
 
 const DURATION_BUCKETS: [(&str, f64); 11] = [
     ("0.005", 0.005),
@@ -62,6 +72,17 @@ impl Metrics {
 
     pub fn increment_billable(&self) {
         self.billable_requests_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            requests_total: self.requests_total.load(Ordering::Relaxed),
+            request_duration_count: self.request_duration_count.load(Ordering::Relaxed),
+            request_duration_sum_seconds: self.request_duration_sum_nanos.load(Ordering::Relaxed)
+                as f64
+                / 1_000_000_000.0,
+            billable_requests_total: self.billable_requests_total.load(Ordering::Relaxed),
+        }
     }
 
     pub fn render_prometheus(&self) -> String {

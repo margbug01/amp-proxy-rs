@@ -6,5 +6,9 @@
 *.log.err
 /capture
 /capture_outbound
+/dist
+/node_modules
+/src-tauri/target
+/src-tauri/gen
 .DS_Store
 .ace-tool/
