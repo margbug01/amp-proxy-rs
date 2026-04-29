@@ -200,21 +200,20 @@ async fn forward_via_chat_completions(
 ) -> anyhow::Result<Response> {
     use crate::customproxy::responses_translator;
 
-    // Strip reasoning fields before the Responses→chat translation so the
-    // upstream provider does not enter thinking mode. Gemini's wire format
-    // cannot carry `reasoning_content` in multi-turn conversations, which
-    // causes DeepSeek (and similar providers) to reject the second request
-    // with "reasoning_content must be passed back to the API".
+    // Strip explicit reasoning requests and reasoning-type history items so
+    // the translated body does not re-enable thinking via `reasoning.effort`
+    // or replay reasoning artifacts the Gemini wire format cannot represent.
+    // We intentionally do *not* force `thinking: disabled` — providers that
+    // default to thinking-on (e.g. DeepSeek v4-flash) may return empty
+    // responses when thinking is forcibly suppressed. The response-side
+    // translators already discard `reasoning_content`, so it is safe to let
+    // the provider think; the reasoning simply won't round-trip back through
+    // Gemini.
     let sanitised = strip_reasoning_fields(responses_body);
 
     // Responses → chat/completions
     let (chat_body, ctx) = responses_translator::translate_responses_request_to_chat(&sanitised)
         .context("gemini bridge: responses→chat translation")?;
-
-    // Explicitly disable thinking mode. DeepSeek v4-flash defaults to
-    // thinking-on; the Gemini wire format cannot round-trip
-    // reasoning_content so multi-turn conversations break.
-    let chat_body = force_thinking_disabled(&chat_body);
 
     let base = provider.url.trim_end_matches('/');
     let url = if base.ends_with("/v1") {
@@ -319,18 +318,13 @@ async fn forward_via_messages(
 ) -> anyhow::Result<Response> {
     use crate::customproxy::messages_translator;
 
-    // Strip reasoning — same rationale as the chat/completions path above.
+    // Strip explicit reasoning requests and reasoning-type history items
+    // (same rationale as the chat/completions path above).
     let sanitised = strip_reasoning_fields(responses_body);
 
     // Responses → Anthropic Messages
     let messages_body = messages_translator::translate_responses_to_messages(&sanitised)
         .context("gemini bridge: responses→messages translation")?;
-
-    // Explicitly disable thinking mode for Anthropic-compatible upstreams
-    // that support DeepSeek's extension. Gemini cannot round-trip thinking
-    // content/signatures, so leaving provider defaults enabled can break
-    // multi-turn conversations.
-    let messages_body = force_thinking_disabled(&messages_body);
 
     let base = provider.url.trim_end_matches('/');
     let url = if base.ends_with("/v1") {
@@ -542,25 +536,12 @@ fn ensure_stream_field(body: &[u8], stream: bool) -> Vec<u8> {
     serde_json::to_vec(&v).unwrap_or_else(|_| body.to_vec())
 }
 
-/// Force-set `thinking: {type: "disabled"}` and remove `reasoning_effort`
-/// on a chat/completions body. DeepSeek v4-flash defaults to thinking-on;
-/// the Gemini bridge cannot round-trip reasoning_content.
-fn force_thinking_disabled(body: &[u8]) -> Vec<u8> {
-    let mut v: Value = match serde_json::from_slice(body) {
-        Ok(v) => v,
-        Err(_) => return body.to_vec(),
-    };
-    if let Some(obj) = v.as_object_mut() {
-        obj.insert("thinking".into(), serde_json::json!({"type": "disabled"}));
-        obj.remove("reasoning_effort");
-    }
-    serde_json::to_vec(&v).unwrap_or_else(|_| body.to_vec())
-}
-
-/// Remove `reasoning` and reasoning-related `input` items from a Responses
-/// body so downstream providers don't enter thinking mode. The Gemini wire
-/// format cannot round-trip `reasoning_content`, which causes DeepSeek to
-/// reject multi-turn requests.
+/// Remove explicit `reasoning` config, `include` hints, and reasoning-type
+/// `input` items from a Responses body. This prevents the downstream
+/// translator from re-enabling thinking via `reasoning.effort` and stops
+/// stale reasoning artifacts from being replayed. Providers that default
+/// to thinking-on will still think; the response translators discard the
+/// resulting `reasoning_content` before it reaches the Gemini wire format.
 fn strip_reasoning_fields(body: &[u8]) -> Vec<u8> {
     let mut v: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
@@ -649,12 +630,4 @@ mod tests {
         assert_eq!(v["stream"], true);
     }
 
-    #[test]
-    fn force_thinking_disabled_sets_disabled_and_removes_reasoning_effort() {
-        let body = br#"{"model":"x","messages":[],"reasoning_effort":"high","thinking":{"type":"enabled"}}"#;
-        let out = force_thinking_disabled(body);
-        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(v["thinking"]["type"], "disabled");
-        assert!(v.get("reasoning_effort").is_none());
-    }
 }
